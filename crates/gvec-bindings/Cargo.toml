@@ -1,0 +1,20 @@
+[package]
+name = "gvec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust binding for the gvec SQLite extension"
+
+[dependencies]
+gvec-core = { workspace = true }
+# rusqlite with bundled SQLite + load_extension for end-to-end .load tests
+rusqlite = { version = "0.32", default-features = false, features = ["bundled", "load_extension"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "gvec_bench"
+path = "examples/gvec_bench.rs"

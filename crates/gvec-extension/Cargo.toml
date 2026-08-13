@@ -1,0 +1,19 @@
+[package]
+name = "gvec-extension"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "gvec_extension"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gvec-core = { workspace = true }
+sqlite-loadable = { workspace = true }
+sqlite-loadable-macros = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

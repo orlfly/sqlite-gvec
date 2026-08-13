@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gvec-core",
+    "crates/gvec-extension",
+    "crates/gvec-bindings",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sqlite-gvec/sqlite-gvec"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+thiserror = "1"
+
+# rusqlite lives in the bindings crate only (not in the extension crate)
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+
+# sqlite-loadable lives in the extension crate only; it uses its own sqlite3ext-sys
+sqlite-loadable = "0.0.6-alpha.6"
+sqlite-loadable-macros = "0.0.3-alpha.3"
+
+# shared internal core
+gvec-core = { path = "crates/gvec-core" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
