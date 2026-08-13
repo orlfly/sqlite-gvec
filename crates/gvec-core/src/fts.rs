@@ -98,16 +98,24 @@ pub fn create_text_index(
     let lbl_pat_lit = quote_string(&format!("%\"{}\"%", label));
     let prop_json = format!("$.{}", property);
 
-    // 1. Create FTS5 virtual table (standalone content — stores its own copy)
+    // 1. Create FTS5 virtual table (standalone content — stores its own copy).
+    //    `IF NOT EXISTS` makes this idempotent against repeated calls with
+    //    the same (prefix, label, property) tuple.
     exec.execute(
         &format!("CREATE VIRTUAL TABLE IF NOT EXISTS {} USING fts5(content, tokenize={})", fts_tbl, quote_string(tok)),
         &[],
     )?;
 
-    // 2. Backfill existing matching nodes
+    // 2. Backfill existing matching nodes. We use `INSERT OR REPLACE` so the
+    //    second call of `create_text_index` for an already-indexed
+    //    (label, property) does not fail with a rowid UNIQUE conflict: each
+    //    existing FTS5 row is replaced with the current property value, and
+    //    new labels/properties get a fresh row. This makes both
+    //    `create_text_index` and `CREATE TEXT INDEX` idempotent at the
+    //    user-visible level.
     exec.execute(
         &format!(
-            "INSERT INTO {}(rowid, content) SELECT id, json_extract(properties, '{}') FROM {} WHERE labels LIKE ?1 AND json_extract(properties, '{}') IS NOT NULL",
+            "INSERT OR REPLACE INTO {}(rowid, content) SELECT id, json_extract(properties, '{}') FROM {} WHERE labels LIKE ?1 AND json_extract(properties, '{}') IS NOT NULL",
             fts_tbl, prop_json, nodes_tbl, prop_json
         ),
         &[SqlValue::Text(format!("%\"{}\"%", label))],

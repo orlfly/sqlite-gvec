@@ -268,6 +268,73 @@ mod tests {
         assert!(rs.rows[0][1].as_f64().unwrap() > 0.0);
     }
 
+    /// Calling `CREATE TEXT INDEX` twice for the same (label, property) must
+    /// not fail with a rowid UNIQUE conflict: the backfill uses
+    /// `INSERT OR REPLACE`, so the second call re-indexes in place and the
+    /// index stays consistent with the current node state.
+    #[test]
+    fn fts_create_text_index_via_cypher_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "Hello", body: "the rust programming language"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {title: "World", body: "python is dynamic"})"#).unwrap();
+
+        // First call: creates the index.
+        g.run(r#"CREATE TEXT INDEX ON :Doc(body)"#).unwrap();
+        // Second call: must not fail and must leave the index usable.
+        g.run(r#"CREATE TEXT INDEX ON :Doc(body)"#).unwrap();
+
+        let res = g.text_search("Doc", "body", "rust", 10).unwrap();
+        assert_eq!(res.len(), 1, "expected only the rust Doc after re-create");
+        let rowids: std::collections::HashSet<i64> = res.iter().map(|(id, _)| *id).collect();
+        assert!(rowids.contains(&1), "rowid 1 should match rust");
+
+        // text_match via WHERE still works through Cypher after the second
+        // CREATE TEXT INDEX.
+        let rs = g.run(r#"MATCH (n:Doc) WHERE text_match(n.body, "rust") RETURN n.title AS title"#).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], json!("Hello"));
+    }
+
+    /// Calling `create_text_index` twice via the Rust binding must also be
+    /// idempotent. This exercises the same INSERT OR REPLACE path directly,
+    /// independent of the Cypher parser, and guards against the (prefix,
+    /// label, property) UNIQUE conflict in any caller.
+    #[test]
+    fn fts_create_text_index_idempotent() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "hello world"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {body: "hello rust"})"#).unwrap();
+
+        g.create_text_index("Doc", "body", None).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        g.create_text_index("Doc", "body", Some("porter")).unwrap();
+
+        let res = g.text_search("Doc", "body", "hello", 10).unwrap();
+        assert_eq!(res.len(), 2, "expected 2 hello hits after re-index");
+        let rowids: std::collections::HashSet<i64> = res.iter().map(|(id, _)| *id).collect();
+        assert!(rowids.contains(&1));
+        assert!(rowids.contains(&2));
+    }
+
+    /// `DROP TEXT INDEX` followed by `CREATE TEXT INDEX` for the same tuple
+    /// must rebuild a working FTS5 index from scratch. This protects users
+    /// who use DROP+CREATE as a deliberate re-index path.
+    #[test]
+    fn fts_drop_then_create_text_index_via_cypher() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust first"})"#).unwrap();
+        g.run(r#"CREATE TEXT INDEX ON :Doc(body)"#).unwrap();
+        g.run("DROP TEXT INDEX ON :Doc(body)").unwrap();
+        // Re-create with a different tokenizer; this also re-indexes the
+        // existing node so search finds it again.
+        g.run(r#"CREATE TEXT INDEX ON :Doc(body) USING fts5(porter)"#).unwrap();
+        let res = g.text_search("Doc", "body", "rust", 5).unwrap();
+        assert_eq!(res.len(), 1);
+    }
+
     #[test]
     fn fts_phrase_match() {
         let db = Database::open_in_memory().unwrap();

@@ -7,6 +7,7 @@
 - [x] 1.5 Implement `text_search(exec, prefix, label, property, query, k) -> Vec<(i64, f32)>`: run FTS5 query with `bm25()` ranking, return top-k `(rowid, score)` pairs
 - [x] 1.6 Detect FTS5 availability at runtime (try `CREATE VIRTUAL TABLE ... USING fts5(...)` on a temp table; cache result)
 - [x] 1.7 Add unit tests: create index, insert nodes, search, BM25 ordering, delete sync
+- [x] 1.8 Make `create_text_index` idempotent: switch the backfill `INSERT INTO` to `INSERT OR REPLACE INTO` so re-running for an already-indexed `(label, property)` tuple replaces existing rows instead of failing with a rowid UNIQUE conflict. This makes both the Rust binding and the `CREATE TEXT INDEX` Cypher statement idempotent at the user-visible level.
 
 ## 2. Query Language Integration (`graph-query-language` modifications)
 
@@ -40,6 +41,7 @@
 - [x] 5.2 Add `Graph::text_search(label, property, query, k) -> Vec<(i64, f32)>` to the Rust binding
 - [x] 5.3 Register `gvec_text_search(graph, label, property, query, k)` scalar in the extension crate
 - [x] 5.4 Add binding tests: create index via Rust API, text_search, hybrid query end-to-end
+- [x] 5.5 Add binding tests covering idempotency: `CREATE TEXT INDEX` called twice via Cypher must not fail with a rowid UNIQUE conflict; Rust `Graph::create_text_index` called twice (with same or different tokenizers) must leave the FTS5 table in a consistent, queryable state; `DROP TEXT INDEX` followed by `CREATE TEXT INDEX` must rebuild the index from scratch.
 
 ## 6. Docs & Finalize
 

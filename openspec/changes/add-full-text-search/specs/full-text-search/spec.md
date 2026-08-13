@@ -19,6 +19,15 @@ The system SHALL support creating an FTS5-backed full-text index over a node pro
 - **WHEN** `CREATE TEXT INDEX ON :Person(body) USING fts5(unknown)` is executed
 - **THEN** the operation fails with an error listing supported tokenizers
 
+#### Scenario: Re-create on existing index is idempotent
+
+- **WHEN** `CREATE TEXT INDEX ON :Person(body)` is executed a second time for an already-indexed `(label, property)` tuple
+- **THEN** the operation succeeds without a UNIQUE rowid conflict, the existing FTS5 rows are replaced in place via `INSERT OR REPLACE`, and a subsequent `text_match` returns the same results as after the first call
+
+### Requirement: Idempotent text index lifecycle
+
+`create_text_index` (and the equivalent `CREATE TEXT INDEX` Cypher statement) MUST be idempotent for the same `(graph, label, property)` tuple. Repeated calls MUST NOT fail with a rowid UNIQUE conflict; they MUST leave the FTS5 shadow table and sync triggers in a state consistent with the current set of nodes for that label.
+
 ### Requirement: Text search via text_match
 
 The system SHALL support a `text_match(variable.property, "query")` predicate that returns true for nodes whose indexed text property matches the FTS5 query. The predicate SHALL produce a BM25-ranked rowid set consumed by the executor.
