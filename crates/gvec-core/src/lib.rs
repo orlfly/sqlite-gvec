@@ -16,6 +16,7 @@ pub mod vector;
 pub mod storage;
 pub mod query;
 pub mod fusion;
+pub mod fts;
 
 pub mod prelude {
     pub use crate::error::{Error, Result};
@@ -25,6 +26,7 @@ pub mod prelude {
     pub use crate::vector::{Distance, ElementType, VectorBlob, VectorValue};
     pub use crate::storage::{Storage, StorageSnapshot};
     pub use crate::sql::{SqlExecutor, SqlValue};
+    pub use crate::fts::{Tokenizer, fts_table_name};
 }
 
 pub use error::{Error, Result};
@@ -34,3 +36,4 @@ pub use edge::{Edge, EdgeRecord};
 pub use vector::{Distance, ElementType, VectorBlob, VectorValue};
 pub use storage::{Storage, StorageSnapshot};
 pub use sql::{SqlExecutor, SqlValue};
+pub use fts::{Tokenizer, fts_table_name};

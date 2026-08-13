@@ -11,8 +11,15 @@ use crate::sql::{SqlExecutor, SqlValue};
 /// Storage facade. Holds the shadow-table prefix and an owned `SqlExecutor`.
 /// Owned (not borrowed) so callers don't need lifetime gymnastics.
 pub struct Storage {
+    /// The database executor (private; bindings use the public methods on `Storage`).
     pub(crate) exec: Box<dyn SqlExecutor>,
     pub prefix: String,
+}
+
+impl Storage {
+    /// Borrow the underlying executor. Used by `gvec-bindings` to access
+    /// FTS5 functionality.
+    pub fn exec_ref(&self) -> &dyn SqlExecutor { &*self.exec }
 }
 
 impl Storage {

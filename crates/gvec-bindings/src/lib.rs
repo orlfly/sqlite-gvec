@@ -124,6 +124,29 @@ impl Graph {
     pub fn knn(&self, query: &gvec_core::vector::VectorValue, stored: &[(i64, gvec_core::vector::VectorValue)], k: usize, dist: gvec_core::vector::Distance) -> Vec<(i64, f32)> {
         gvec_core::vector::knn_search(query, stored, k, dist)
     }
+
+    /// Create an FTS5 text index over `label.property`. Returns an error if the
+    /// tokenizer name is not recognized.
+    pub fn create_text_index(&self, label: &str, property: &str, tokenizer: Option<&str>) -> Result<()> {
+        let t = match tokenizer {
+            Some(name) => gvec_core::fts::Tokenizer::parse(name).ok_or_else(|| Error::Parse {
+                message: format!("unknown tokenizer: {name}"),
+                position: None,
+            })?,
+            None => gvec_core::fts::Tokenizer::Unicode61,
+        };
+        gvec_core::fts::create_text_index(self.storage.exec_ref(), &self.storage.prefix, label, property, &t)
+    }
+
+    /// Drop an FTS5 text index.
+    pub fn drop_text_index(&self, label: &str, property: &str) -> Result<()> {
+        gvec_core::fts::drop_text_index(self.storage.exec_ref(), &self.storage.prefix, label, property)
+    }
+
+    /// Run a BM25-ranked FTS search. Returns up to `k` `(rowid, score)` pairs.
+    pub fn text_search(&self, label: &str, property: &str, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        gvec_core::fts::text_search(self.storage.exec_ref(), &self.storage.prefix, label, property, query, k)
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +210,101 @@ mod tests {
         assert_eq!(res[1].0, 1);
     }
 
+    #[test]
+    fn fts_filters_rows_by_rowid_set() {
+        // Regression: text_match must actually filter rows by the FTS rowid set,
+        // not pass everything through. Previously Expr::TextMatch returned true,
+        // so a query asking for "rust" would also return nodes with non-matching bodies.
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "Rust guide", body: "the rust programming language"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {title: "Python guide", body: "python is dynamic and high-level"})"#).unwrap();
+        g.run(r#"CREATE (c:Doc {title: "Rust async", body: "rust async runtime and tokio"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        let rs = g.run(r#"MATCH (n:Doc) WHERE text_match(n.body, "rust") RETURN n.title AS title ORDER BY title ASC"#).unwrap();
+        assert_eq!(rs.rows.len(), 2, "expected only the 2 rust rows, got: {:?}", rs.rows);
+        let titles: Vec<String> = rs.rows.iter().map(|r| r[0].as_str().unwrap_or("").to_string()).collect();
+        assert!(titles.contains(&"Rust async".to_string()));
+        assert!(titles.contains(&"Rust guide".to_string()));
+        assert!(!titles.contains(&"Python guide".to_string()));
+    }
+
+    #[test]
+    fn fts_rejects_unsafe_identifier() {
+        // Identifier validation must reject anything that's not a plain SQL
+        // identifier (alphanumeric + underscore, no quotes/dashes).
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:D {body: "x"})"#).unwrap();
+        let r = g.create_text_index("D", "body\"; DROP TABLE D_nodes;--", None);
+        assert!(r.is_err(), "expected identifier validation to reject injection payload");
+    }
+
+    #[test]
+    fn fts_create_and_search() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "Rust database", body: "the rust database is fast"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {title: "Python", body: "python is dynamic"})"#).unwrap();
+        g.run(r#"CREATE (c:Doc {title: "Rust async", body: "rust async runtime"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        let res = g.text_search("Doc", "body", "rust", 10).unwrap();
+        assert_eq!(res.len(), 2, "expected 2 rust hits");
+        // higher score = more relevant
+        let rowids: std::collections::HashSet<i64> = res.iter().map(|(id, _)| *id).collect();
+        assert!(rowids.contains(&1));
+        assert!(rowids.contains(&3));
+    }
+
+    #[test]
+    fn fts_create_text_index_via_cypher() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "Hello", body: "the rust programming language"})"#).unwrap();
+        g.run(r#"CREATE TEXT INDEX ON :Doc(body)"#).unwrap();
+        let rs = g.run(r#"MATCH (n:Doc) WHERE text_match(n.body, "rust") RETURN n.title AS title, text_score(n) AS score ORDER BY score DESC"#).unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], json!("Hello"));
+        assert!(rs.rows[0][1].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn fts_phrase_match() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "the rust database is fast"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {body: "rust is the language database users pick"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        // Phrase match (quoted in FTS5)
+        let res = g.text_search("Doc", "body", "\"rust database\"", 10).unwrap();
+        assert_eq!(res.len(), 1, "phrase should match only node with the exact words in sequence");
+    }
+
+    #[test]
+    fn fts_drop_index() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "hello"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        g.drop_text_index("Doc", "body").unwrap();
+        // After drop, text_search should fail (table doesn't exist)
+        let r = g.text_search("Doc", "body", "hello", 5);
+        assert!(r.is_err(), "expected error after dropping index");
+    }
+
+    #[test]
+    fn fts_create_and_drop_via_cypher() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust rocks"})"#).unwrap();
+        g.run(r#"CREATE TEXT INDEX ON :Doc(body) USING fts5(porter)"#).unwrap();
+        let res = g.text_search("Doc", "body", "rust", 5).unwrap();
+        assert_eq!(res.len(), 1);
+        g.run("DROP TEXT INDEX ON :Doc(body)").unwrap();
+        let r = g.text_search("Doc", "body", "rust", 5);
+        assert!(r.is_err());
+    }
+
     /// Loads the compiled `libgvec_extension.so` into a fresh connection
     /// and verifies the entry point + scalar functions are registered.
     /// Skips if the extension .so is not built.
@@ -205,6 +323,8 @@ mod tests {
         let d: f64 = conn.query_row("SELECT gvec_dist('[1.0, 0.0]', '[3.0, 0.0]', 'l2')", [], |r| r.get(0)).unwrap();
         assert!((d - 2.0).abs() < 1e-6);
         let err: String = conn.query_row("SELECT gvec_query('CREATE (n:Person {})')", [], |r| r.get(0)).unwrap_or_else(|e| e.to_string());
+        assert!(err.contains("Rust binding crate"), "expected helpful error, got: {err}");
+        let err: String = conn.query_row("SELECT gvec_text_search('g', 'Doc', 'body', 'q', 5)", [], |r| r.get(0)).unwrap_or_else(|e| e.to_string());
         assert!(err.contains("Rust binding crate"), "expected helpful error, got: {err}");
     }
 

@@ -54,6 +54,14 @@ let stored = vec![
 let q = VectorValue::F32(vec![0.0, 0.0]);
 let nearest = g.knn(&q, &stored, 2, Distance::L2);
 assert_eq!(nearest[0].0, 3);
+
+// Full-text search via SQLite FTS5
+g.run(r#"CREATE (a:Doc {title: "Hello", body: "the rust programming language"})"#).unwrap();
+g.run(r#"CREATE (b:Doc {title: "World", body: "python is dynamic"})"#).unwrap();
+g.run(r#"CREATE TEXT INDEX ON :Doc(body)"#).unwrap();
+let rs = g.run(r#"MATCH (n:Doc) WHERE text_match(n.body, "rust") RETURN n.title AS title, text_score(n) AS score ORDER BY score DESC"#).unwrap();
+assert_eq!(rs.rows.len(), 1);
+assert_eq!(rs.rows[0][0], "Hello");
 ```
 
 ## Quick start (SQLite extension)

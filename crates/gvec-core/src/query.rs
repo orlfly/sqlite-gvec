@@ -23,6 +23,8 @@ pub enum Statement {
     Match(Match),
     Set(Set),
     Delete(Delete),
+    CreateTextIndex(CreateTextIndex),
+    DropTextIndex(DropTextIndex),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +61,19 @@ pub struct Assign {
 pub struct Delete {
     pub variables: Vec<String>,
     pub detach: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateTextIndex {
+    pub label: String,
+    pub property: String,
+    pub tokenizer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DropTextIndex {
+    pub label: String,
+    pub property: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,6 +133,8 @@ pub struct OrderItem {
 pub enum Expr {
     Variable(String, Option<String>),
     VectorNn { variable: String, property: Option<String>, k: i64, query: Box<Expr> },
+    TextMatch { variable: String, property: String, query: String },
+    TextScore { variable: String },
     Literal(Value),
     Cmp(Box<Expr>, CmpOp, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
@@ -189,7 +206,7 @@ impl<'a> Lexer<'a> {
             "TRUE" => Tok::BoolLit(true),
             "FALSE" => Tok::BoolLit(false),
             "NULL" => Tok::NullLit,
-            "AND" | "OR" | "NOT" | "IN" | "CREATE" | "MATCH" | "OPTIONAL" | "RETURN" | "SET" | "DELETE" | "DETACH" | "WHERE" | "ORDER" | "BY" | "SKIP" | "LIMIT" | "ASC" | "DESC" | "AS" | "VECTOR_NN" => Tok::Kw(s.to_ascii_uppercase()),
+            "AND" | "OR" | "NOT" | "IN" | "CREATE" | "MATCH" | "OPTIONAL" | "RETURN" | "SET" | "DELETE" | "DETACH" | "WHERE" | "ORDER" | "BY" | "SKIP" | "LIMIT" | "ASC" | "DESC" | "AS" | "VECTOR_NN" | "TEXT_MATCH" | "TEXT_SCORE" | "DROP" => Tok::Kw(s.to_ascii_uppercase()),
             _ => Tok::Ident(s.into()),
         }
     }
@@ -352,7 +369,23 @@ impl Parser {
         match self.peek() {
             Tok::Kw(k) if k == "CREATE" => {
                 self.bump();
+                // CREATE TEXT INDEX variant uses identifiers "TEXT"/"INDEX"
+                if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("TEXT")) {
+                    self.bump();
+                    self.expect_ident("INDEX")?;
+                    return Ok(Statement::CreateTextIndex(self.parse_create_text_index()?));
+                }
                 Ok(Statement::Create(Create { patterns: self.parse_patterns()? }))
+            }
+            Tok::Kw(k) if k == "DROP" => {
+                self.bump();
+                // DROP TEXT INDEX variant uses identifiers "TEXT"/"INDEX"
+                if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("TEXT")) {
+                    self.bump();
+                    self.expect_ident("INDEX")?;
+                    return Ok(Statement::DropTextIndex(self.parse_drop_text_index()?));
+                }
+                return Err(Error::Parse { message: "expected TEXT INDEX after DROP".into(), position: None });
             }
             Tok::Kw(k) if k == "MATCH" || k == "OPTIONAL" => Ok(Statement::Match(self.parse_match()?)),
             Tok::Kw(k) if k == "SET" => {
@@ -375,6 +408,58 @@ impl Parser {
             }
             _ => Err(Error::Parse { message: format!("expected statement, got {:?}", self.peek()), position: None }),
         }
+    }
+
+    fn expect_ident(&mut self, want: &str) -> Result<()> {
+        match self.peek().clone() {
+            Tok::Ident(s) if s.eq_ignore_ascii_case(want) => { self.bump(); Ok(()) }
+            other => Err(Error::Parse {
+                message: format!("expected identifier {want}, got {:?}", other),
+                position: None,
+            }),
+        }
+    }
+
+    fn parse_create_text_index(&mut self) -> Result<CreateTextIndex> {
+        // ON :Label(property) [USING fts5(tokenizer)]
+        self.expect_ident("ON")?;
+        self.expect_tok(Tok::Colon, ":")?;
+        let label = if let Tok::Ident(s) = self.peek().clone() { self.bump(); s } else {
+            return Err(Error::Parse { message: "expected label name".into(), position: None });
+        };
+        self.expect_tok(Tok::LParen, "(")?;
+        let property = if let Tok::Ident(s) = self.peek().clone() { self.bump(); s } else {
+            return Err(Error::Parse { message: "expected property name".into(), position: None });
+        };
+        self.expect_tok(Tok::RParen, ")")?;
+        let mut tokenizer = None;
+        if self.peek_ident("USING") {
+            self.bump();
+            self.expect_ident("FTS5")?;
+            self.expect_tok(Tok::LParen, "(")?;
+            if let Tok::Ident(s) = self.peek().clone() { self.bump(); tokenizer = Some(s); }
+            else { return Err(Error::Parse { message: "expected tokenizer name".into(), position: None }); }
+            self.expect_tok(Tok::RParen, ")")?;
+        }
+        Ok(CreateTextIndex { label, property, tokenizer })
+    }
+
+    fn parse_drop_text_index(&mut self) -> Result<DropTextIndex> {
+        self.expect_ident("ON")?;
+        self.expect_tok(Tok::Colon, ":")?;
+        let label = if let Tok::Ident(s) = self.peek().clone() { self.bump(); s } else {
+            return Err(Error::Parse { message: "expected label name".into(), position: None });
+        };
+        self.expect_tok(Tok::LParen, "(")?;
+        let property = if let Tok::Ident(s) = self.peek().clone() { self.bump(); s } else {
+            return Err(Error::Parse { message: "expected property name".into(), position: None });
+        };
+        self.expect_tok(Tok::RParen, ")")?;
+        Ok(DropTextIndex { label, property })
+    }
+
+    fn peek_ident(&self, want: &str) -> bool {
+        if let Tok::Ident(s) = self.peek() { s.eq_ignore_ascii_case(want) } else { false }
     }
 
     fn parse_match(&mut self) -> Result<Match> {
@@ -576,21 +661,44 @@ impl Parser {
             Tok::NumLit(f) => { self.bump(); Ok(Expr::Literal(Value::from(f))) }
             Tok::BoolLit(b) => { self.bump(); Ok(Expr::Literal(Value::Bool(b))) }
             Tok::NullLit => { self.bump(); Ok(Expr::Literal(Value::Null)) }
-            Tok::Ident(s) => {
-                self.bump();
-                if s.eq_ignore_ascii_case("VECTOR_NN") && matches!(self.peek(), Tok::LParen) {
+            Tok::Kw(k) => {
+                // Pseudo-functions tokenized as keywords: vector_nn, text_match, text_score
+                self.bump(); // consume the keyword token
+                if k.eq_ignore_ascii_case("VECTOR_NN") && matches!(self.peek(), Tok::LParen) {
                     self.bump();
                     let (var, prop) = self.parse_var_with_prop()?;
                     self.expect_tok(Tok::Comma, ",")?;
                     let qexpr = self.parse_expr()?;
                     self.expect_tok(Tok::Comma, ",")?;
-                    let k = match self.peek().clone() {
+                    let kn = match self.peek().clone() {
                         Tok::IntLit(n) => { self.bump(); n }
                         _ => return Err(Error::Parse { message: "expected integer k".into(), position: None }),
                     };
                     self.expect_tok(Tok::RParen, ")")?;
-                    return Ok(Expr::VectorNn { variable: var, property: prop, k, query: Box::new(qexpr) });
+                    return Ok(Expr::VectorNn { variable: var, property: prop, k: kn, query: Box::new(qexpr) });
                 }
+                if k.eq_ignore_ascii_case("TEXT_MATCH") && matches!(self.peek(), Tok::LParen) {
+                    self.bump();
+                    let (var, prop) = self.parse_var_with_prop()?;
+                    let property = prop.unwrap_or_default();
+                    self.expect_tok(Tok::Comma, ",")?;
+                    let query = match self.peek().clone() {
+                        Tok::StrLit(q) => { self.bump(); q }
+                        _ => return Err(Error::Parse { message: "expected string query in text_match".into(), position: None }),
+                    };
+                    self.expect_tok(Tok::RParen, ")")?;
+                    return Ok(Expr::TextMatch { variable: var, property, query });
+                }
+                if k.eq_ignore_ascii_case("TEXT_SCORE") && matches!(self.peek(), Tok::LParen) {
+                    self.bump();
+                    let (var, _) = self.parse_var_with_prop()?;
+                    self.expect_tok(Tok::RParen, ")")?;
+                    return Ok(Expr::TextScore { variable: var });
+                }
+                Err(Error::Parse { message: format!("unexpected keyword {k}"), position: None })
+            }
+            Tok::Ident(s) => {
+                self.bump();
                 let mut property = None;
                 if matches!(self.peek(), Tok::Dot) {
                     self.bump();
@@ -653,7 +761,12 @@ pub fn execute(storage: &Storage, query: &Query) -> Result<ResultSet> {
 }
 
 #[derive(Default, Clone)]
-struct ExecState { rows: Vec<Row> }
+struct ExecState {
+    rows: Vec<Row>,
+    /// Map from node rowid → BM25 score, populated when a `text_match` predicate
+    /// is present in WHERE. Used by `text_score()` in RETURN.
+    text_scores: std::collections::HashMap<i64, f32>,
+}
 
 fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> Result<ExecState> {
     match stmt {
@@ -665,10 +778,58 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
         }
         Statement::Match(m) => {
             if state.rows.is_empty() { state.rows = vec![Row::new()]; }
+
+            // Pre-extract TextMatch from WHERE to get FTS rowid set + scores.
+            // The rowid set is used to FILTER rows after execute_match; the
+            // scores are injected as __fts_score__ so text_score() in RETURN
+            // can read them.
+            let (fts_rowids, fts_scores): (std::collections::HashSet<i64>, std::collections::HashMap<i64, f32>) =
+                if let Some(where_) = &m.where_ {
+                    if let Some((rowids, scores)) = extract_text_match(storage, where_, &m.patterns)? {
+                        (rowids.into_iter().collect(), scores)
+                    } else {
+                        (Default::default(), Default::default())
+                    }
+                } else {
+                    (Default::default(), Default::default())
+                };
+
             let mut current = state.rows.clone();
             for pattern in &m.patterns {
                 current = execute_match(storage, pattern, &current, m.optional)?;
             }
+
+            // Filter rows by the FTS rowid set (when a text_match was used) AND
+            // inject the BM25 score for text_score() lookup.
+            if !fts_rowids.is_empty() {
+                current.retain(|r| {
+                    let mut kept = false;
+                    for (_, value) in r.iter() {
+                        if let Some(Value::Object(node_obj)) = value.get("node") {
+                            if let Some(id) = node_obj.get("id").and_then(|v| v.as_i64()) {
+                                if fts_rowids.contains(&id) {
+                                    kept = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    kept
+                });
+            }
+            for row in &mut current {
+                for (_, value) in row.iter() {
+                    if let Some(Value::Object(node_obj)) = value.get("node") {
+                        if let Some(id) = node_obj.get("id").and_then(|v| v.as_i64()) {
+                            if let Some(&score) = fts_scores.get(&id) {
+                                row.insert("__fts_score__".into(), Value::from(score as f64));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            state.text_scores = fts_scores;
             if let Some(w) = &m.where_ {
                 current = current.into_iter().filter(|r| eval(w, r).as_bool().unwrap_or(false)).collect();
             }
@@ -711,6 +872,69 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
             for &id in &nodes { storage.delete_node(NodeId(id))?; }
             Ok(state)
         }
+        Statement::CreateTextIndex(cti) => {
+            let tokenizer = match &cti.tokenizer {
+                Some(t) => crate::fts::Tokenizer::parse(t).ok_or_else(|| Error::Parse {
+                    message: format!("unknown tokenizer '{}'; supported: unicode61, porter, trigram", t),
+                    position: None,
+                })?,
+                None => crate::fts::Tokenizer::Unicode61,
+            };
+            crate::fts::create_text_index(storage.exec.as_ref(), &storage.prefix, &cti.label, &cti.property, &tokenizer)?;
+            Ok(state)
+        }
+        Statement::DropTextIndex(dti) => {
+            crate::fts::drop_text_index(storage.exec.as_ref(), &storage.prefix, &dti.label, &dti.property)?;
+            Ok(state)
+        }
+    }
+}
+
+/// Extract a `text_match` predicate from the WHERE clause, run the FTS5 search,
+/// and return `(rowids, scores_by_rowid)`. Returns `None` if no text_match.
+fn extract_text_match(
+    storage: &Storage,
+    where_: &Expr,
+    patterns: &[Pattern],
+) -> Result<Option<(Vec<i64>, std::collections::HashMap<i64, f32>)>> {
+    // Find the TextMatch expression by walking the WHERE tree
+    let tm = find_text_match(where_);
+    let tm = match tm {
+        Some(Expr::TextMatch { property, query, .. }) => (property.clone(), query.clone()),
+        Some(_) => return Ok(None),
+        None => return Ok(None),
+    };
+    // Determine the label from the first pattern's first node
+    let label = patterns.first()
+        .and_then(|p| p.segments.first())
+        .and_then(|s| s.node.labels.first())
+        .cloned()
+        .unwrap_or_default();
+    if label.is_empty() {
+        return Err(Error::Query("text_match requires a labeled node pattern".into()));
+    }
+    // Run FTS search
+    let results = crate::fts::text_search(
+        storage.exec.as_ref(),
+        &storage.prefix,
+        &label,
+        &tm.0,
+        &tm.1,
+        50,
+    )?;
+    let rowids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
+    let scores: std::collections::HashMap<i64, f32> = results.into_iter().collect();
+    Ok(Some((rowids, scores)))
+}
+
+/// Recursively search for a TextMatch expression in the WHERE tree.
+fn find_text_match(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::TextMatch { .. } => Some(e),
+        Expr::And(a, b) | Expr::Or(a, b) => find_text_match(a).or_else(|| find_text_match(b)),
+        Expr::Not(a) => find_text_match(a),
+        Expr::Cmp(a, _, b) => find_text_match(a).or_else(|| find_text_match(b)),
+        _ => None,
     }
 }
 
@@ -887,12 +1111,6 @@ fn extend_pattern(storage: &Storage, segs: &[Segment], anchor: NodeId, row: &Row
     if out.is_empty() { None } else { Some(out) }
 }
 
-fn merge(base: &Row, ext: &Row) -> Row {
-    let mut m = base.clone();
-    for (k, v) in ext { m.insert(k.clone(), v.clone()); }
-    m
-}
-
 fn node_to_value(n: Node) -> Value {
     serde_json::json!({
         "node": {
@@ -1009,6 +1227,16 @@ fn eval(e: &Expr, row: &Row) -> Value {
         Expr::Or(a, b) => Value::Bool(eval(a, row).as_bool().unwrap_or(false) || eval(b, row).as_bool().unwrap_or(false)),
         Expr::Not(a) => Value::Bool(!eval(a, row).as_bool().unwrap_or(false)),
         Expr::VectorNn { .. } => Value::Bool(true),
+        Expr::TextMatch { .. } => Value::Bool(true),
+        Expr::TextScore { variable } => {
+            // The score for this row was injected by the executor; read it.
+            // The variable name in the text_score expression identifies the
+            // bound node, but we don't actually need it — the score is on the
+            // row regardless of which node is bound.
+            let _ = variable;
+            if let Some(score) = row.get("__fts_score__") { return score.clone(); }
+            Value::from(0.0f64)
+        }
     }
 }
 

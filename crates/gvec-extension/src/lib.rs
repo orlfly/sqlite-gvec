@@ -1,8 +1,9 @@
 //! gvec SQLite extension — loadable into any SQLite via `.load libgvec.so`.
 //!
 //! Symbols registered on init:
-//!   - `gvec_version()`           scalar TEXT starting with `v`
-//!   - `gvec_dist(a, b, metric)`  scalar REAL
+//!   - `gvec_version()`                          scalar TEXT starting with `v`
+//!   - `gvec_dist(a, b, metric)`                 scalar REAL
+//!   - `gvec_text_search(graph, label, prop, q, k)` scalar JSON array of {rowid, score}
 //!
 //! For full Cypher execution including graph traversal and pattern matching,
 //! use the `gvec` Rust binding crate, which provides the in-process engine
@@ -24,6 +25,7 @@ pub fn sqlite3_gvec_init(db: *mut sqlite3) -> Result<()> {
     define_scalar_function(db, "gvec_version", 0, gvec_version, FunctionFlags::UTF8 | FunctionFlags::DETERMINISTIC)?;
     define_scalar_function(db, "gvec_dist", 3, gvec_dist, FunctionFlags::UTF8 | FunctionFlags::DETERMINISTIC)?;
     define_scalar_function(db, "gvec_query", 1, gvec_query_stub, FunctionFlags::UTF8)?;
+    define_scalar_function(db, "gvec_text_search", 5, gvec_text_search_stub, FunctionFlags::UTF8)?;
     Ok(())
 }
 
@@ -57,6 +59,16 @@ fn gvec_dist(context: *mut sqlite3_context, values: &[*mut sqlite3_value]) -> Re
 /// loadable scalar function does not have. See `crates/gvec-bindings`.
 fn gvec_query_stub(context: *mut sqlite3_context, _values: &[*mut sqlite3_value]) -> Result<()> {
     api::result_error(context, "gvec_query requires the gvec Rust binding crate (https://crates.io/crates/gvec); the loadable extension exposes scalar functions only");
+    Ok(())
+}
+
+/// `gvec_text_search(graph, label, prop, query, k)` is registered for API
+/// stability, but in the loadable extension it returns a clear error
+/// pointing users at the Rust binding. The actual FTS5 search requires an
+/// owned `rusqlite::Connection` which a loadable scalar function does not
+/// have (see notes on `gvec_query_stub` above).
+fn gvec_text_search_stub(context: *mut sqlite3_context, _values: &[*mut sqlite3_value]) -> Result<()> {
+    api::result_error(context, "gvec_text_search requires the gvec Rust binding crate; the loadable extension exposes scalar functions only");
     Ok(())
 }
 
