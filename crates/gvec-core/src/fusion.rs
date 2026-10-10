@@ -45,7 +45,9 @@ pub fn vector_from_scalar(v: &Value) -> Result<VectorValue> {
 
 fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
     let s = s.trim_start_matches("0x");
-    if s.len() % 2 != 0 { return Err("odd length".into()); }
+    if s.len() % 2 != 0 {
+        return Err("odd length".into());
+    }
     let mut out = Vec::with_capacity(s.len() / 2);
     let bytes = s.as_bytes();
     for i in 0..s.len() / 2 {
@@ -66,13 +68,22 @@ fn hex_nibble(b: u8) -> std::result::Result<u8, String> {
 
 /// Extract a node's stored vector (if any) given a property name. Currently a
 /// stub: vectors live in the virtual table, so we always return None here.
-pub fn node_vector(_storage: &Storage, _rowid: i64, _property: &str) -> Result<Option<VectorValue>> {
+pub fn node_vector(
+    _storage: &Storage,
+    _rowid: i64,
+    _property: &str,
+) -> Result<Option<VectorValue>> {
     Ok(None)
 }
 
 /// Convenience: KNN across an in-memory collection, used by tests and the
 /// bindings. Distances default to L2.
-pub fn knn(query: &VectorValue, stored: &[(i64, VectorValue)], k: usize, d: Distance) -> Vec<(i64, f32)> {
+pub fn knn(
+    query: &VectorValue,
+    stored: &[(i64, VectorValue)],
+    k: usize,
+    d: Distance,
+) -> Vec<(i64, f32)> {
     knn_search(query, stored, k, d)
 }
 
@@ -82,10 +93,14 @@ pub fn vector_distance(a: &VectorValue, b: &VectorValue, d: Distance) -> f32 {
 }
 
 /// Re-export vector blob encoder.
-pub fn encode_blob(v: &VectorValue) -> VectorBlob { VectorBlob::encode(v) }
+pub fn encode_blob(v: &VectorValue) -> VectorBlob {
+    VectorBlob::encode(v)
+}
 
 /// Decode a vector blob (used by bindings to read back BLOB storage).
-pub fn decode_blob(b: &VectorBlob) -> Result<VectorValue> { b.decode() }
+pub fn decode_blob(b: &VectorBlob) -> Result<VectorValue> {
+    b.decode()
+}
 
 #[cfg(test)]
 mod tests {

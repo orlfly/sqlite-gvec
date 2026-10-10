@@ -81,7 +81,9 @@ impl VectorBlob {
                         self.dim
                     )));
                 }
-                Ok(VectorValue::I8(self.bytes.iter().map(|b| *b as i8).collect()))
+                Ok(VectorValue::I8(
+                    self.bytes.iter().map(|b| *b as i8).collect(),
+                ))
             }
             ElementType::Binary => {
                 if self.bytes.len() * 8 != self.dim {
@@ -144,35 +146,59 @@ fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     x.iter().zip(y).map(|(a, b)| a * b).sum()
 }
 fn l2_f32(x: &[f32], y: &[f32]) -> f32 {
-    x.iter().zip(y).map(|(a, b)| {
-        let d = a - b;
-        d * d
-    }).sum::<f32>().sqrt()
+    x.iter()
+        .zip(y)
+        .map(|(a, b)| {
+            let d = a - b;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
 }
 fn cosine_f32(x: &[f32], y: &[f32]) -> f32 {
-    let mut dot = 0f32; let mut ax = 0f32; let mut ay = 0f32;
+    let mut dot = 0f32;
+    let mut ax = 0f32;
+    let mut ay = 0f32;
     for (a, b) in x.iter().zip(y) {
-        dot += a * b; ax += a * a; ay += b * b;
+        dot += a * b;
+        ax += a * a;
+        ay += b * b;
     }
-    if ax == 0.0 || ay == 0.0 { return 1.0; }
+    if ax == 0.0 || ay == 0.0 {
+        return 1.0;
+    }
     1.0 - dot / (ax.sqrt() * ay.sqrt())
 }
 fn dot_i8(x: &[i8], y: &[i8]) -> f32 {
-    x.iter().zip(y).map(|(a, b)| (*a as f32) * (*b as f32)).sum()
+    x.iter()
+        .zip(y)
+        .map(|(a, b)| (*a as f32) * (*b as f32))
+        .sum()
 }
 fn l2_i8(x: &[i8], y: &[i8]) -> f32 {
-    x.iter().zip(y).map(|(a, b)| {
-        let d = *a as f32 - *b as f32;
-        d * d
-    }).sum::<f32>().sqrt()
+    x.iter()
+        .zip(y)
+        .map(|(a, b)| {
+            let d = *a as f32 - *b as f32;
+            d * d
+        })
+        .sum::<f32>()
+        .sqrt()
 }
 fn cosine_i8(x: &[i8], y: &[i8]) -> f32 {
-    let mut dot = 0f32; let mut ax = 0f32; let mut ay = 0f32;
+    let mut dot = 0f32;
+    let mut ax = 0f32;
+    let mut ay = 0f32;
     for (a, b) in x.iter().zip(y) {
-        let a = *a as f32; let b = *b as f32;
-        dot += a * b; ax += a * a; ay += b * b;
+        let a = *a as f32;
+        let b = *b as f32;
+        dot += a * b;
+        ax += a * a;
+        ay += b * b;
     }
-    if ax == 0.0 || ay == 0.0 { return 1.0; }
+    if ax == 0.0 || ay == 0.0 {
+        return 1.0;
+    }
     1.0 - dot / (ax.sqrt() * ay.sqrt())
 }
 fn hamming(x: &[u8], y: &[u8]) -> u32 {

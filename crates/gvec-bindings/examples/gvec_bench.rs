@@ -13,7 +13,9 @@ fn bench<F: FnMut()>(label: &str, n: u32, mut f: F) {
     // warmup
     f();
     let t = Instant::now();
-    for _ in 0..n { f(); }
+    for _ in 0..n {
+        f();
+    }
     let d = t.elapsed();
     let per = d / n;
     println!("{label:30} n={n:6} total={d:?} per-op={per:?}");

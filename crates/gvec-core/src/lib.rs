@@ -6,34 +6,34 @@
 //! and `gvec-bindings` (via `rusqlite`). The `SqlExecutor` trait here is the
 //! boundary those crates implement.
 
-pub mod error;
-pub mod sql;
-pub mod ids;
-pub mod property;
-pub mod node;
 pub mod edge;
-pub mod vector;
-pub mod storage;
-pub mod query;
-pub mod fusion;
+pub mod error;
 pub mod fts;
+pub mod fusion;
+pub mod ids;
+pub mod node;
+pub mod property;
+pub mod query;
+pub mod sql;
+pub mod storage;
+pub mod vector;
 
 pub mod prelude {
+    pub use crate::edge::{Edge, EdgeRecord};
     pub use crate::error::{Error, Result};
+    pub use crate::fts::{fts_table_name, Tokenizer};
     pub use crate::ids::{EdgeId, NodeId};
     pub use crate::node::{Node, NodeRecord};
-    pub use crate::edge::{Edge, EdgeRecord};
-    pub use crate::vector::{Distance, ElementType, VectorBlob, VectorValue};
-    pub use crate::storage::{Storage, StorageSnapshot};
     pub use crate::sql::{SqlExecutor, SqlValue};
-    pub use crate::fts::{Tokenizer, fts_table_name};
+    pub use crate::storage::{Storage, StorageSnapshot};
+    pub use crate::vector::{Distance, ElementType, VectorBlob, VectorValue};
 }
 
+pub use edge::{Edge, EdgeRecord};
 pub use error::{Error, Result};
+pub use fts::{fts_table_name, Tokenizer};
 pub use ids::{EdgeId, NodeId};
 pub use node::{Node, NodeRecord};
-pub use edge::{Edge, EdgeRecord};
-pub use vector::{Distance, ElementType, VectorBlob, VectorValue};
-pub use storage::{Storage, StorageSnapshot};
 pub use sql::{SqlExecutor, SqlValue};
-pub use fts::{Tokenizer, fts_table_name};
+pub use storage::{Storage, StorageSnapshot};
+pub use vector::{Distance, ElementType, VectorBlob, VectorValue};

@@ -21,6 +21,10 @@ pub struct NodeRecord {
 
 impl From<&Node> for NodeRecord {
     fn from(n: &Node) -> Self {
-        Self { id: n.id.0, labels: n.labels.clone(), properties: n.properties.clone() }
+        Self {
+            id: n.id.0,
+            labels: n.labels.clone(),
+            properties: n.properties.clone(),
+        }
     }
 }

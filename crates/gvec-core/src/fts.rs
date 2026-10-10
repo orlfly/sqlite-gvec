@@ -43,14 +43,21 @@ pub fn fts_table_name(prefix: &str, label: &str, property: &str) -> String {
 /// Build the trigger names for sync.
 fn trigger_names(prefix: &str, label: &str, property: &str) -> (String, String, String) {
     let base = format!("{}_fts_trig_{}_{}", prefix, label, property);
-    (format!("{}_ins", base), format!("{}_upd", base), format!("{}_del", base))
+    (
+        format!("{}_ins", base),
+        format!("{}_upd", base),
+        format!("{}_del", base),
+    )
 }
 
 /// Validate that `s` is a safe SQL identifier: ASCII letter / digit / underscore,
 /// must not be empty, must not start with a digit.
 fn validate_identifier(kind: &str, s: &str) -> Result<()> {
     if s.is_empty() {
-        return Err(crate::error::Error::Parse { message: format!("{kind} must not be empty"), position: None });
+        return Err(crate::error::Error::Parse {
+            message: format!("{kind} must not be empty"),
+            position: None,
+        });
     }
     let mut chars = s.chars();
     let first = chars.next().unwrap();
@@ -102,7 +109,11 @@ pub fn create_text_index(
     //    `IF NOT EXISTS` makes this idempotent against repeated calls with
     //    the same (prefix, label, property) tuple.
     exec.execute(
-        &format!("CREATE VIRTUAL TABLE IF NOT EXISTS {} USING fts5(content, tokenize={})", fts_tbl, quote_string(tok)),
+        &format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {} USING fts5(content, tokenize={})",
+            fts_tbl,
+            quote_string(tok)
+        ),
         &[],
     )?;
 
@@ -162,7 +173,12 @@ pub fn create_text_index(
 }
 
 /// Drop an FTS5 index and its triggers.
-pub fn drop_text_index(exec: &dyn SqlExecutor, prefix: &str, label: &str, property: &str) -> Result<()> {
+pub fn drop_text_index(
+    exec: &dyn SqlExecutor,
+    prefix: &str,
+    label: &str,
+    property: &str,
+) -> Result<()> {
     validate_identifier("prefix", prefix)?;
     validate_identifier("label", label)?;
     validate_identifier("property", property)?;
@@ -171,7 +187,10 @@ pub fn drop_text_index(exec: &dyn SqlExecutor, prefix: &str, label: &str, proper
     for t in [&trig_ins, &trig_upd, &trig_del] {
         let _ = exec.execute(&format!("DROP TRIGGER IF EXISTS {}", quote_ident(t)), &[]);
     }
-    exec.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(&fts_tbl)), &[])?;
+    exec.execute(
+        &format!("DROP TABLE IF EXISTS {}", quote_ident(&fts_tbl)),
+        &[],
+    )?;
     Ok(())
 }
 
@@ -195,10 +214,18 @@ pub fn text_search(
         "SELECT rowid, -bm25({}) AS score FROM {} WHERE {} MATCH ?1 ORDER BY score DESC LIMIT ?2",
         q_tbl, q_tbl, q_tbl
     );
-    let rows = exec.query_all_json(&sql, &[SqlValue::Text(query.to_string()), SqlValue::Integer(k as i64)])?;
+    let rows = exec.query_all_json(
+        &sql,
+        &[
+            SqlValue::Text(query.to_string()),
+            SqlValue::Integer(k as i64),
+        ],
+    )?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        if row.len() < 2 { continue; }
+        if row.len() < 2 {
+            continue;
+        }
         let rowid = match &row[0] {
             Value::Number(n) => n.as_i64().unwrap_or(0),
             Value::String(s) => s.parse().unwrap_or(0),
@@ -215,8 +242,14 @@ pub fn text_search(
 
 /// Check whether FTS5 is available in the current SQLite build.
 pub fn fts5_available(exec: &dyn SqlExecutor) -> bool {
-    match exec.execute("CREATE VIRTUAL TABLE IF NOT EXISTS __gvec_fts5_probe USING fts5(x)", &[]) {
-        Ok(_) => { let _ = exec.execute("DROP TABLE IF EXISTS __gvec_fts5_probe", &[]); true }
+    match exec.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS __gvec_fts5_probe USING fts5(x)",
+        &[],
+    ) {
+        Ok(_) => {
+            let _ = exec.execute("DROP TABLE IF EXISTS __gvec_fts5_probe", &[]);
+            true
+        }
         Err(_) => false,
     }
 }

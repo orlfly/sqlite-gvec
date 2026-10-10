@@ -13,7 +13,10 @@ pub enum Error {
     Query(String),
 
     #[error("parse error at {position:?}: {message}")]
-    Parse { message: String, position: Option<(usize, usize)> },
+    Parse {
+        message: String,
+        position: Option<(usize, usize)>,
+    },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
