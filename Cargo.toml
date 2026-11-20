@@ -23,7 +23,7 @@ bytes = "1"
 thiserror = "1"
 
 # rusqlite lives in the bindings crate only (not in the extension crate)
-rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.41", default-features = false, features = ["bundled"] }
 
 # sqlite-loadable lives in the extension crate only; it uses its own sqlite3ext-sys
 sqlite-loadable = "0.0.6-alpha.6"
