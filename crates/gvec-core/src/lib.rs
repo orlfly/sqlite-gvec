@@ -29,7 +29,7 @@ pub mod prelude {
     pub use crate::sql::{SqlExecutor, SqlValue};
     pub use crate::storage::{Storage, StorageSnapshot, VectorIndexMeta};
     pub use crate::tag::TagIndexMeta;
-    pub use crate::vector::{Distance, ElementType, VectorBlob, VectorValue};
+    pub use crate::vector::{Distance, ElementType, VectorBlob, VectorRow, VectorValue};
     pub use crate::vector_index::{
         FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
         VectorIndexConfig,
@@ -44,7 +44,7 @@ pub use node::{Node, NodeRecord};
 pub use sql::{SqlExecutor, SqlValue};
 pub use storage::{Storage, StorageSnapshot, VectorIndexMeta};
 pub use tag::TagIndexMeta;
-pub use vector::{Distance, ElementType, VectorBlob, VectorValue};
+pub use vector::{Distance, ElementType, VectorBlob, VectorRow, VectorValue};
 pub use vector_index::{
     FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
     VectorIndexConfig,

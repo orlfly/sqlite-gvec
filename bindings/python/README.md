@@ -41,12 +41,18 @@ g.run('CREATE (d:Doc {title: "hello", body: "hello vector world", embedding: [0.
 g.create_vector_index("Doc", "embedding", "hnsw", "l2", {"m": 16})
 print(g.vector_search("Doc", "embedding", Vector((0.1, 0.2)), 5))
 
+# Persistent rows work without an index too.
+print(g.vector_rows("Doc", "embedding"))
+print(g.node_vector(1, "embedding"))
+g.set_vector_row(1, "sidecar", Vector((0.3, 0.4)))
+
 # Hybrid text + vector query
 g.create_text_index("Doc", "body")
 print(g.run('''
     MATCH (n:Doc)
     WHERE text_match(n.body, "hello") AND vector_nn(n.embedding, [0.1, 0.2], 5)
-    RETURN n.title, text_score(n), vector_distance(n)
+    RETURN n.title, text_score(n), vector_distance(n), vector_score(n)
+    ORDER BY vector_score(n) DESC
 '''))
 
 # Exact tag index and tag-aware hybrid query

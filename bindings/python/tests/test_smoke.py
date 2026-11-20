@@ -29,6 +29,9 @@ def smoke():
     docs.run('CREATE (a:Doc {title: "origin", body: "the rust programming language", tags: ["database", "rust"], embedding: [0.0, 0.0]})')
     docs.run('CREATE (b:Doc {title: "near", body: "python is dynamic", tags: ["python", "web"], embedding: [1.0, 0.0]})')
     docs.run('CREATE (c:Doc {title: "far", body: "unrelated notes", tags: ["notes"], embedding: [5.0, 5.0]})')
+    assert docs.vector_row_count("Doc", "embedding") == 3
+    assert len(docs.vector_rows("Doc", "embedding")) == 3
+    assert docs.node_vector(1, "embedding") == [0.0, 0.0]
     meta = docs.create_vector_index(
         "Doc", "embedding", "hnsw", "l2", {"m": 8, "ef_search": 32}
     )
@@ -38,6 +41,10 @@ def smoke():
 
     hits = docs.vector_search("Doc", "embedding", Vector((0.0, 0.0)), 2)
     assert [rowid for rowid, _ in hits] == [1, 2], hits
+    docs.set_vector_row(2, "embedding", Vector((0.0, 1.0)))
+    assert docs.node_vector(2, "embedding") == [0.0, 1.0]
+    hits = docs.vector_search("Doc", "embedding", Vector((0.0, 1.0)), 1)
+    assert hits[0][0] == 2, hits
 
     rows = docs.run(
         "MATCH (n:Doc) WHERE vector_nn(n.embedding, [0.0, 0.0], 2) "

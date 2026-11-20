@@ -4,11 +4,12 @@
 //! pure Rust API. No FFI to the host — the entire engine lives in this crate.
 
 pub use gvec_core::error::{Error, Result};
+pub use gvec_core::ids::{EdgeId, NodeId};
 use gvec_core::sql::{SqlExecutor, SqlValue};
 use gvec_core::storage::Storage;
 pub use gvec_core::storage::VectorIndexMeta;
 pub use gvec_core::tag::TagIndexMeta;
-pub use gvec_core::vector::{Distance, ElementType, VectorBlob, VectorValue};
+pub use gvec_core::vector::{Distance, ElementType, VectorBlob, VectorRow, VectorValue};
 pub use gvec_core::vector_index::{
     FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
     VectorIndexConfig,
@@ -217,6 +218,31 @@ impl Graph {
 
     pub fn vector_count(&self, label: &str, property: &str) -> Result<usize> {
         self.storage.vector_count(label, property)
+    }
+
+    /// Count persisted vector rows without requiring a vector index.
+    pub fn vector_row_count(&self, label: Option<&str>, property: Option<&str>) -> Result<usize> {
+        self.storage.vector_row_count(label, property)
+    }
+
+    /// List persisted vector rows, optionally filtered by label/property.
+    pub fn vector_rows(
+        &self,
+        label: Option<&str>,
+        property: Option<&str>,
+    ) -> Result<Vec<gvec_core::vector::VectorRow>> {
+        self.storage.vector_rows(label, property)
+    }
+
+    /// Persist a vector row explicitly when the vector is not stored in the
+    /// node's JSON properties.
+    pub fn set_vector_row(&self, node: NodeId, property: &str, vector: &VectorValue) -> Result<()> {
+        self.storage.upsert_vector_row(node, property, vector)
+    }
+
+    /// Read a node's persisted vector row, falling back to its JSON property.
+    pub fn node_vector(&self, node: NodeId, property: &str) -> Result<Option<VectorValue>> {
+        gvec_core::fusion::node_vector(&self.storage, node.0, property)
     }
 
     /// ANN search over `label.property`. Uses the configured index (HNSW by
@@ -990,6 +1016,260 @@ mod tests {
         let indexes = g.list_vector_indexes().unwrap();
         assert_eq!(indexes[0].algorithm, "hnsw");
         assert_eq!(indexes[0].metric, "l2");
+    }
+
+    #[test]
+    fn vector_rows_persist_on_crud_and_reopen() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vector_rows.db");
+        let path = path.to_str().unwrap().to_string();
+
+        {
+            let db = Database::open(&path).unwrap();
+            let g = db.graph("rows").unwrap();
+            g.run(r#"CREATE (a:Doc {title: "a", embedding: [0.0, 0.0]})"#)
+                .unwrap();
+            g.run(r#"CREATE (b:Doc {title: "b", embedding: [1.0, 0.0]})"#)
+                .unwrap();
+            g.run(r#"CREATE (c:Other {embedding: [0.0, 1.0]})"#)
+                .unwrap();
+
+            assert_eq!(g.vector_row_count(None, Some("embedding")).unwrap(), 3);
+            assert_eq!(
+                g.vector_row_count(Some("Doc"), Some("embedding")).unwrap(),
+                2
+            );
+            assert_eq!(g.vector_rows(Some("Doc"), None).unwrap().len(), 2);
+
+            // Scalar arrays are not mistaken for vectors.
+            g.run(r#"CREATE (d:Doc {tags: ["a", "b"], id: 42})"#)
+                .unwrap();
+            assert_eq!(g.vector_rows(Some("Doc"), None).unwrap().len(), 2);
+
+            let doc_nodes = g.storage.list_nodes_by_label("Doc").unwrap();
+            let a = doc_nodes
+                .iter()
+                .find(|n| n.properties["title"] == json!("a"))
+                .unwrap()
+                .id;
+            let b = doc_nodes
+                .iter()
+                .find(|n| n.properties["title"] == json!("b"))
+                .unwrap()
+                .id;
+            assert_eq!(
+                g.node_vector(a, "embedding").unwrap(),
+                Some(VectorValue::F32(vec![0.0, 0.0]))
+            );
+
+            // Explicit rows support vectors kept out of JSON properties and
+            // update the vector index when one exists.
+            g.create_vector_index("Doc", "embedding", "flat", None, None)
+                .unwrap();
+            g.set_vector_row(b, "embedding", &VectorValue::F32(vec![9.0, 9.0]))
+                .unwrap();
+            let hits = g
+                .vector_search("Doc", "embedding", &VectorValue::F32(vec![9.0, 9.0]), 1)
+                .unwrap();
+            assert_eq!(hits[0].0, b.0);
+            assert_eq!(hits[0].1, 0.0);
+            assert_eq!(
+                g.node_vector(b, "embedding").unwrap(),
+                Some(VectorValue::F32(vec![9.0, 9.0]))
+            );
+
+            // Property updates and removals keep rows in sync.
+            g.run(r#"MATCH (n:Doc {title: "a"}) SET n.embedding = [2.0, 0.0]"#)
+                .unwrap();
+            assert_eq!(
+                g.node_vector(a, "embedding").unwrap(),
+                Some(VectorValue::F32(vec![2.0, 0.0]))
+            );
+            g.run(r#"MATCH (n:Doc {title: "a"}) SET n.embedding = null"#)
+                .unwrap();
+            assert_eq!(g.node_vector(a, "embedding").unwrap(), None);
+            assert_eq!(
+                g.vector_row_count(Some("Doc"), Some("embedding")).unwrap(),
+                1
+            );
+
+            g.run(r#"MATCH (n:Doc {title: "b"}) DELETE n"#).unwrap();
+            assert_eq!(
+                g.vector_row_count(Some("Doc"), Some("embedding")).unwrap(),
+                0
+            );
+            assert_eq!(g.vector_row_count(None, Some("embedding")).unwrap(), 1);
+        }
+
+        let db = Database::open(&path).unwrap();
+        let g = db.graph("rows").unwrap();
+        assert_eq!(g.vector_row_count(None, Some("embedding")).unwrap(), 1);
+        let rows = g.vector_rows(None, Some("embedding")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vector, VectorValue::F32(vec![0.0, 1.0]));
+    }
+
+    #[test]
+    fn vector_nn_without_label_and_scores() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "origin", embedding: [0.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "near", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (c:Other {title: "far", embedding: [5.0, 5.0]})"#)
+            .unwrap();
+
+        // No index: exact KNN reads the persistent rows.
+        let hits = g
+            .exact_vector_search(
+                "Doc",
+                "embedding",
+                &VectorValue::F32(vec![0.0, 0.0]),
+                2,
+                Distance::L2,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].1, 0.0);
+        assert!(hits[1].1 > hits[0].1);
+
+        // An unlabeled vector_nn searches every node with the property.
+        let rs = g
+            .run(
+                r#"MATCH (n) WHERE vector_nn(n.embedding, [0.0, 0.0], 3)
+                   RETURN n.title AS title, vector_distance(n) AS distance,
+                          vector_score(n) AS score
+                   ORDER BY vector_score(n) DESC"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 3, "rows: {:?}", rs.rows);
+        let titles: Vec<&str> = rs.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(titles, vec!["origin", "near", "far"]);
+        for row in &rs.rows {
+            let distance = row[1].as_f64().unwrap();
+            let score = row[2].as_f64().unwrap();
+            let expected = 1.0 / (1.0 + distance);
+            assert!((score - expected).abs() < 1e-6);
+        }
+
+        // Cosine scores expose cosine similarity rather than distance.
+        g.create_vector_index("Doc", "embedding", "flat", Some("cosine"), None)
+            .unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [1.0, 0.0], 2)
+                   RETURN n.title AS title, vector_score(n) AS score
+                   ORDER BY vector_score(n) DESC"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows[0][0], json!("near"));
+        assert!((rs.rows[0][1].as_f64().unwrap() - 1.0).abs() < 1e-6);
+        assert!(rs.rows[0][1].as_f64().unwrap() >= rs.rows[1][1].as_f64().unwrap());
+    }
+
+    #[test]
+    fn vector_rows_support_int8_and_dimension_checks() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        let id = g
+            .storage
+            .create_node(
+                &["Doc".to_string()],
+                &json!({"v": {"type": "int8", "values": [1, 2, 3]}}),
+            )
+            .unwrap();
+        assert_eq!(
+            g.node_vector(id, "v").unwrap(),
+            Some(VectorValue::I8(vec![1, 2, 3]))
+        );
+        let rows = g.vector_rows(Some("Doc"), Some("v")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].vector, VectorValue::I8(vec![1, 2, 3]));
+
+        g.create_vector_index("Doc", "v", "flat", None, None)
+            .unwrap();
+        let err = g
+            .set_vector_row(id, "v", &VectorValue::F32(vec![1.0, 2.0, 3.0]))
+            .unwrap_err();
+        assert!(format!("{err}").contains("type"), "got: {err}");
+    }
+
+    #[test]
+    fn vector_rows_backfill_from_existing_indexes() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vector_rows_migrate.db");
+        let path = path.to_str().unwrap().to_string();
+
+        {
+            let db = Database::open(&path).unwrap();
+            let g = db.graph("migrate").unwrap();
+            g.run(r#"CREATE (a:Doc {embedding: [0.0, 0.0]})"#).unwrap();
+            g.run(r#"CREATE (b:Doc {embedding: [1.0, 0.0]})"#).unwrap();
+            g.create_vector_index("Doc", "embedding", "flat", None, None)
+                .unwrap();
+            assert_eq!(
+                g.vector_row_count(Some("Doc"), Some("embedding")).unwrap(),
+                2
+            );
+
+            // Simulate a database created before the vector_rows table existed.
+            let prefix = g.storage.prefix.clone();
+            g.storage
+                .exec_ref()
+                .execute(&format!("DROP TABLE {prefix}_vector_rows"), &[])
+                .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let g = db.graph("migrate").unwrap();
+        assert_eq!(g.list_vector_indexes().unwrap().len(), 1);
+        assert_eq!(
+            g.vector_row_count(Some("Doc"), Some("embedding")).unwrap(),
+            2
+        );
+        assert_eq!(
+            g.node_vector(gvec_core::ids::NodeId(1), "embedding")
+                .unwrap(),
+            Some(VectorValue::F32(vec![0.0, 0.0]))
+        );
+    }
+
+    #[test]
+    fn explicit_vector_rows_are_indexed_on_create() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        let id = g
+            .storage
+            .create_node(&["Doc".to_string()], &json!({"title": "sidecar"}))
+            .unwrap();
+        g.set_vector_row(id, "sidecar", &VectorValue::F32(vec![0.0, 1.0]))
+            .unwrap();
+
+        // An unrelated property update must not delete the sidecar row.
+        g.run(r#"MATCH (n:Doc {title: "sidecar"}) SET n.title = "updated""#)
+            .unwrap();
+        assert_eq!(
+            g.node_vector(id, "sidecar").unwrap(),
+            Some(VectorValue::F32(vec![0.0, 1.0]))
+        );
+
+        g.create_vector_index("Doc", "sidecar", "flat", None, None)
+            .unwrap();
+        let hits = g
+            .vector_search("Doc", "sidecar", &VectorValue::F32(vec![0.0, 1.0]), 1)
+            .unwrap();
+        assert_eq!(hits[0].0, id.0);
+        assert_eq!(hits[0].1, 0.0);
+
+        g.run(r#"MATCH (n:Doc {title: "updated"}) SET n.title = "again""#)
+            .unwrap();
+        let hits = g
+            .vector_search("Doc", "sidecar", &VectorValue::F32(vec![0.0, 1.0]), 1)
+            .unwrap();
+        assert_eq!(hits[0].0, id.0);
     }
 
     #[test]

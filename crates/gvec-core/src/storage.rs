@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
@@ -92,6 +92,13 @@ impl Storage {
         // Issue one statement at a time; `SqlExecutor::execute` runs a single
         // statement only (rusqlite's `execute` does not handle `;`-separated
         // batches).
+        let vector_rows_existed = self
+            .exec
+            .query_one_json(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                &[SqlValue::Text(self.tbl("vector_rows"))],
+            )?
+            .is_some();
         self.exec.execute(
             &format!(
                 "CREATE TABLE IF NOT EXISTS {nodes} (
@@ -188,7 +195,55 @@ impl Storage {
             ),
             &[],
         )?;
+        self.exec.execute(
+            &format!(
+                "CREATE TABLE IF NOT EXISTS {rows} (
+                node_id INTEGER NOT NULL,
+                property TEXT NOT NULL,
+                vector TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                element_type TEXT NOT NULL,
+                PRIMARY KEY (node_id, property),
+                FOREIGN KEY(node_id) REFERENCES {nodes}(id) ON DELETE CASCADE
+            )",
+                rows = self.tbl("vector_rows"),
+                nodes = self.tbl("nodes"),
+            ),
+            &[],
+        )?;
+        self.exec.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {}_vector_rows_property
+                 ON {}(property)",
+                self.prefix,
+                self.tbl("vector_rows")
+            ),
+            &[],
+        )?;
+        if !vector_rows_existed {
+            self.backfill_vector_rows_from_indexes()?;
+        }
         crate::tag::ensure_schema(self.exec.as_ref(), &self.prefix)?;
+        Ok(())
+    }
+
+    /// One-time migration for databases created before persistent vector rows
+    /// existed: copy vectors from the per-index table into `vector_rows`.
+    fn backfill_vector_rows_from_indexes(&self) -> Result<()> {
+        for meta in self.vector_indexes()? {
+            let rows = self.exec.query_all_json(
+                &format!(
+                    "SELECT node_id, vector FROM {} WHERE index_id = ?1",
+                    self.tbl("vectors")
+                ),
+                &[SqlValue::from(meta.id)],
+            )?;
+            for row in rows {
+                let node_id = NodeId(json_to_i64(&row[0])?);
+                let blob = VectorBlob::from_hex(&json_to_string(&row[1])?)?;
+                self.insert_vector_row_raw(node_id, &meta.property, &blob.decode()?)?;
+            }
+        }
         Ok(())
     }
 
@@ -200,6 +255,7 @@ impl Storage {
             "rowids",
             "auxiliary",
             "vectors",
+            "vector_rows",
             "vector_indexes",
             "tags",
             "tag_indexes",
@@ -220,6 +276,7 @@ impl Storage {
         // Validate and stage vector-index rows before writing, so a malformed
         // vector does not leave a half-written node behind.
         let prepared = self.prepare_node_vectors(labels, properties)?;
+        let vector_rows = self.prepare_node_vector_rows(labels, properties)?;
         self.exec.execute(
             &format!(
                 "INSERT INTO {} (labels, properties) VALUES (?1, ?2)",
@@ -232,6 +289,7 @@ impl Storage {
         )?;
         let id = NodeId(self.exec.last_insert_rowid());
         self.apply_node_vectors(id, &prepared)?;
+        self.replace_node_vector_rows(id, &vector_rows, &HashSet::new())?;
         Ok(id)
     }
 
@@ -480,10 +538,19 @@ impl Storage {
     }
 
     /// Update a node's labels and properties, keeping matching vector indexes
-    /// in sync. All existing vector rows for the node are replaced atomically
-    /// with the vectors implied by the new state.
+    /// in sync. Rows derived from the previous JSON state are replaced with the
+    /// vectors implied by the new state; explicit sidecar rows for properties
+    /// that never appeared in JSON are preserved.
     pub fn update_node(&self, id: NodeId, labels: &[String], properties: &Value) -> Result<()> {
-        let prepared = self.prepare_node_vectors(labels, properties)?;
+        let previous = self.get_node(id)?;
+        let previous_rows =
+            self.prepare_node_vector_rows(&previous.labels, &previous.properties)?;
+        let previous_properties: HashSet<String> = previous_rows
+            .into_iter()
+            .map(|(property, _)| property)
+            .collect();
+        self.prepare_node_vectors(labels, properties)?;
+        let vector_rows = self.prepare_node_vector_rows(labels, properties)?;
         let n = self.exec.execute(
             &format!(
                 "UPDATE {} SET labels = ?1, properties = ?2 WHERE id = ?3",
@@ -498,8 +565,9 @@ impl Storage {
         if n == 0 {
             return Err(Error::Storage(format!("node {} not found", id.0)));
         }
-        self.clear_node_vectors(id)?;
-        self.apply_node_vectors(id, &prepared)?;
+        self.clear_node_index_vectors(id)?;
+        self.replace_node_vector_rows(id, &vector_rows, &previous_properties)?;
+        self.reindex_node_vector_rows(id)?;
         Ok(())
     }
 
@@ -777,6 +845,42 @@ impl Storage {
             prepared.push((node_id, vector));
         }
 
+        // Explicit rows keep vectors outside node JSON; include them when
+        // building or rebuilding an index. JSON-derived vectors are already in
+        // `prepared`, so skip duplicates.
+        let mut prepared_ids: HashSet<i64> = prepared.iter().map(|(id, _)| id.0).collect();
+        for row in self.vector_rows(Some(label), Some(property))? {
+            if !prepared_ids.insert(row.node_id) {
+                continue;
+            }
+            let vector = row.vector;
+            match expected_dim {
+                None => expected_dim = Some(vector.dim()),
+                Some(dim) if dim != vector.dim() => {
+                    return Err(Error::Vector(format!(
+                        "node {} property {} has dimension {}, index expects {dim}",
+                        row.node_id,
+                        property,
+                        vector.dim()
+                    )))
+                }
+                _ => {}
+            }
+            match expected_type {
+                None => expected_type = Some(vector.element_type().as_str()),
+                Some(ty) if ty != vector.element_type().as_str() => {
+                    return Err(Error::Vector(format!(
+                        "node {} property {} has type {}, index expects {ty}",
+                        row.node_id,
+                        property,
+                        vector.element_type().as_str()
+                    )))
+                }
+                _ => {}
+            }
+            prepared.push((NodeId(row.node_id), vector));
+        }
+
         self.exec.execute(
             &format!(
                 "INSERT INTO {tbl} (label, property, algorithm, metric, params, dim, element_type)
@@ -811,6 +915,7 @@ impl Storage {
         )?;
 
         for (node_id, vector) in prepared {
+            self.insert_vector_row_raw(node_id, property, &vector)?;
             self.upsert_index_vector(meta.id, node_id, &vector)?;
         }
 
@@ -851,6 +956,261 @@ impl Storage {
         Ok(row
             .and_then(|r| r.first().and_then(|v| v.as_i64()))
             .unwrap_or(0) as usize)
+    }
+
+    /// Count persisted vector rows, optionally filtered by node label and
+    /// property. Unlike `vector_count`, this does not require a vector index.
+    pub fn vector_row_count(&self, label: Option<&str>, property: Option<&str>) -> Result<usize> {
+        let mut sql = format!("SELECT COUNT(*) FROM {}", self.tbl("vector_rows"));
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        if let Some(label) = label.filter(|l| !l.is_empty()) {
+            sql.push_str(&format!(
+                " JOIN {} n ON n.id = {}.node_id",
+                self.tbl("nodes"),
+                self.tbl("vector_rows")
+            ));
+            clauses.push(format!("n.labels LIKE ?{}", params.len() + 1));
+            params.push(SqlValue::Text(format!("%\"{}\"%", label)));
+        }
+        if let Some(property) = property {
+            clauses.push(format!(
+                "{}.property = ?{}",
+                self.tbl("vector_rows"),
+                params.len() + 1
+            ));
+            params.push(SqlValue::Text(property.to_string()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        let row = self.exec.query_one_json(&sql, &params)?;
+        Ok(row
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0) as usize)
+    }
+
+    /// List persisted vector rows, optionally filtered by node label and
+    /// property. The label filter joins the node table so multi-label nodes are
+    /// handled by the same `labels LIKE` semantics as pattern matching.
+    pub fn vector_rows(
+        &self,
+        label: Option<&str>,
+        property: Option<&str>,
+    ) -> Result<Vec<crate::vector::VectorRow>> {
+        let mut sql = format!(
+            "SELECT vr.node_id, vr.property, vr.vector FROM {} vr",
+            self.tbl("vector_rows")
+        );
+        let mut clauses = Vec::new();
+        let mut params = Vec::new();
+        if let Some(label) = label.filter(|l| !l.is_empty()) {
+            sql.push_str(&format!(
+                " JOIN {} n ON n.id = vr.node_id",
+                self.tbl("nodes")
+            ));
+            clauses.push(format!("n.labels LIKE ?{}", params.len() + 1));
+            params.push(SqlValue::Text(format!("%\"{}\"%", label)));
+        }
+        if let Some(property) = property {
+            clauses.push(format!("vr.property = ?{}", params.len() + 1));
+            params.push(SqlValue::Text(property.to_string()));
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY vr.node_id, vr.property");
+        let rows = self.exec.query_all_json(&sql, &params)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let node_id = json_to_i64(&row[0])?;
+            let property = json_to_string(&row[1])?;
+            let blob = VectorBlob::from_hex(&json_to_string(&row[2])?)?;
+            out.push(crate::vector::VectorRow {
+                node_id,
+                property,
+                vector: blob.decode()?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Fetch one persisted vector row by node id and property.
+    pub fn get_vector_row(
+        &self,
+        node_id: NodeId,
+        property: &str,
+    ) -> Result<Option<crate::vector::VectorRow>> {
+        let row = self.exec.query_one_json(
+            &format!(
+                "SELECT node_id, property, vector FROM {} WHERE node_id = ?1 AND property = ?2",
+                self.tbl("vector_rows")
+            ),
+            &[
+                SqlValue::from(node_id.0),
+                SqlValue::Text(property.to_string()),
+            ],
+        )?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let blob = VectorBlob::from_hex(&json_to_string(&row[2])?)?;
+        Ok(Some(crate::vector::VectorRow {
+            node_id: json_to_i64(&row[0])?,
+            property: json_to_string(&row[1])?,
+            vector: blob.decode()?,
+        }))
+    }
+
+    /// Explicitly upsert a vector row. Node property writes populate rows
+    /// automatically; this API is for callers that keep vectors out of the
+    /// node's JSON properties (for example, a sidecar embedding table).
+    pub fn upsert_vector_row(
+        &self,
+        node_id: NodeId,
+        property: &str,
+        vector: &VectorValue,
+    ) -> Result<()> {
+        if property.is_empty() {
+            return Err(Error::Vector("vector property must not be empty".into()));
+        }
+        if vector.dim() == 0 {
+            return Err(Error::Vector("vector must not be empty".into()));
+        }
+        let node = self.get_node(node_id)?;
+        let mut matching = Vec::new();
+        for meta in self.vector_indexes()? {
+            if meta.property != property || !node.labels.iter().any(|l| l == &meta.label) {
+                continue;
+            }
+            if let Some(dim) = meta.dim {
+                if dim != vector.dim() {
+                    return Err(Error::Vector(format!(
+                        "node {} property {} has dimension {}, index expects {dim}",
+                        node_id.0,
+                        property,
+                        vector.dim()
+                    )));
+                }
+            }
+            if let Some(ty) = meta.element_type.as_deref() {
+                if ty != vector.element_type().as_str() {
+                    return Err(Error::Vector(format!(
+                        "node {} property {} has type {}, index expects {ty}",
+                        node_id.0,
+                        property,
+                        vector.element_type().as_str()
+                    )));
+                }
+            }
+            matching.push(meta);
+        }
+        self.insert_vector_row_raw(node_id, property, vector)?;
+        for meta in matching {
+            self.upsert_index_vector(meta.id, node_id, vector)?;
+        }
+        self.invalidate_all_indexes();
+        Ok(())
+    }
+
+    fn insert_vector_row_raw(
+        &self,
+        node_id: NodeId,
+        property: &str,
+        vector: &VectorValue,
+    ) -> Result<()> {
+        let encoded = VectorBlob::encode(vector).to_hex();
+        self.exec.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {} (node_id, property, vector, dim, element_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                self.tbl("vector_rows")
+            ),
+            &[
+                SqlValue::from(node_id.0),
+                SqlValue::Text(property.to_string()),
+                SqlValue::Text(encoded),
+                SqlValue::from(vector.dim() as i64),
+                SqlValue::Text(vector.element_type().as_str().to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn replace_node_vector_rows(
+        &self,
+        node_id: NodeId,
+        rows: &[(String, VectorValue)],
+        remove: &HashSet<String>,
+    ) -> Result<()> {
+        for property in remove {
+            self.exec.execute(
+                &format!(
+                    "DELETE FROM {} WHERE node_id = ?1 AND property = ?2",
+                    self.tbl("vector_rows")
+                ),
+                &[SqlValue::from(node_id.0), SqlValue::Text(property.clone())],
+            )?;
+        }
+        for (property, vector) in rows {
+            self.insert_vector_row_raw(node_id, property, vector)?;
+        }
+        self.invalidate_all_indexes();
+        Ok(())
+    }
+
+    /// Re-attach every persisted row for `node_id` to the indexes whose label
+    /// and property match. This keeps explicit sidecar rows indexed after an
+    /// unrelated property or label update, which clears the node's index rows
+    /// first.
+    fn reindex_node_vector_rows(&self, node_id: NodeId) -> Result<()> {
+        let node = self.get_node(node_id)?;
+        let indexes = self.vector_indexes()?;
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let rows = self.exec.query_all_json(
+            &format!(
+                "SELECT property, vector FROM {} WHERE node_id = ?1",
+                self.tbl("vector_rows")
+            ),
+            &[SqlValue::from(node_id.0)],
+        )?;
+        for row in rows {
+            let property = json_to_string(&row[0])?;
+            let vector = VectorBlob::from_hex(&json_to_string(&row[1])?)?.decode()?;
+            for meta in &indexes {
+                if meta.property != property
+                    || !node.labels.iter().any(|label| label == &meta.label)
+                {
+                    continue;
+                }
+                if let Some(dim) = meta.dim {
+                    if dim != vector.dim() {
+                        return Err(Error::Vector(format!(
+                            "node {} property {} has dimension {}, index expects {dim}",
+                            node_id.0,
+                            property,
+                            vector.dim()
+                        )));
+                    }
+                }
+                if let Some(ty) = meta.element_type.as_deref() {
+                    if ty != vector.element_type().as_str() {
+                        return Err(Error::Vector(format!(
+                            "node {} property {} has type {}, index expects {ty}",
+                            node_id.0,
+                            property,
+                            vector.element_type().as_str()
+                        )));
+                    }
+                }
+                self.upsert_index_vector(meta.id, node_id, &vector)?;
+            }
+        }
+        Ok(())
     }
 
     /// ANN search against the index on `label.property`. If no index exists,
@@ -931,8 +1291,21 @@ impl Storage {
         k: usize,
         metric: Distance,
     ) -> Result<Vec<(i64, f32)>> {
-        let nodes = self.list_nodes_by_label(label)?;
+        let rows = self.vector_rows((!label.is_empty()).then_some(label), Some(property))?;
         let mut stored = Vec::new();
+        for row in &rows {
+            if row.vector.dim() != query.dim() || row.vector.element_type() != query.element_type()
+            {
+                continue;
+            }
+            stored.push((row.node_id, row.vector.clone()));
+        }
+        if !stored.is_empty() {
+            return Ok(crate::vector::knn_search(query, &stored, k, metric));
+        }
+        // Legacy/backfill fallback: rows are populated on node writes, but an
+        // older database may not have them yet.
+        let nodes = self.list_nodes_by_label(label)?;
         for node in nodes {
             let Some(value) = resolve(&node.properties, property) else {
                 continue;
@@ -943,12 +1316,50 @@ impl Storage {
             let vector = VectorValue::from_json(value).map_err(|e| {
                 Error::Vector(format!("node {} property {}: {e}", node.id.0, property))
             })?;
-            if vector.dim() != query.dim() {
+            if vector.dim() != query.dim() || vector.element_type() != query.element_type() {
                 continue;
             }
             stored.push((node.id.0, vector));
         }
         Ok(crate::vector::knn_search(query, &stored, k, metric))
+    }
+
+    /// Build the persistent vector rows implied by a node's current state.
+    ///
+    /// Top-level arrays of numbers and typed vector objects are detected
+    /// automatically. Hex strings and nested property paths are also picked up
+    /// when the label/property is declared by a vector index, avoiding false
+    /// positives on ordinary string identifiers.
+    fn prepare_node_vector_rows(
+        &self,
+        labels: &[String],
+        properties: &Value,
+    ) -> Result<Vec<(String, VectorValue)>> {
+        let mut detected: HashMap<String, VectorValue> = HashMap::new();
+        if let Some(map) = properties.as_object() {
+            for (property, value) in map {
+                if let Some(vector) = detect_vector_value(value) {
+                    detected.insert(property.clone(), vector);
+                }
+            }
+        }
+        for meta in self.vector_indexes()? {
+            if !labels.iter().any(|l| l == &meta.label) {
+                continue;
+            }
+            let Some(value) = resolve(properties, &meta.property) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            if let Ok(vector) = VectorValue::from_json(value) {
+                detected.insert(meta.property.clone(), vector);
+            }
+        }
+        let mut rows: Vec<(String, VectorValue)> = detected.into_iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(rows)
     }
 
     fn prepare_node_vectors(
@@ -1041,6 +1452,16 @@ impl Storage {
     }
 
     fn clear_node_vectors(&self, node_id: NodeId) -> Result<()> {
+        self.clear_node_index_vectors(node_id)?;
+        self.exec.execute(
+            &format!("DELETE FROM {} WHERE node_id = ?1", self.tbl("vector_rows")),
+            &[SqlValue::from(node_id.0)],
+        )?;
+        self.invalidate_all_indexes();
+        Ok(())
+    }
+
+    fn clear_node_index_vectors(&self, node_id: NodeId) -> Result<()> {
         self.exec.execute(
             &format!("DELETE FROM {} WHERE node_id = ?1", self.tbl("vectors")),
             &[SqlValue::from(node_id.0)],
@@ -1086,6 +1507,20 @@ impl Storage {
         out.insert("nodes".into(), Value::from(n));
         out.insert("edges".into(), Value::from(e));
         Ok(out)
+    }
+}
+
+/// Best-effort detection of vector-valued properties without confusing ordinary
+/// string arrays (tags, aliases) or scalar identifiers for vectors.
+fn detect_vector_value(value: &Value) -> Option<VectorValue> {
+    match value {
+        Value::Array(items)
+            if !items.is_empty() && items.iter().all(|item| item.is_number() || item.is_null()) =>
+        {
+            VectorValue::from_json(value).ok()
+        }
+        Value::Object(map) if map.contains_key("type") => VectorValue::from_json(value).ok(),
+        _ => None,
     }
 }
 

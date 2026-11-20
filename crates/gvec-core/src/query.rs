@@ -12,6 +12,7 @@ use crate::ids::{EdgeId, NodeId};
 use crate::node::Node;
 use crate::property::resolve as resolve_path;
 use crate::storage::Storage;
+use crate::vector::{similarity_score, Distance};
 
 // ===========================================================================
 // AST
@@ -180,6 +181,9 @@ pub enum Expr {
         tag: String,
     },
     TextScore {
+        variable: String,
+    },
+    VectorDistance {
         variable: String,
     },
     VectorScore {
@@ -1467,10 +1471,13 @@ impl Parser {
                     self.expect_tok(Tok::RParen, ")")?;
                     return Ok(Expr::TextScore { variable: var });
                 }
-                if (k.eq_ignore_ascii_case("VECTOR_SCORE")
-                    || k.eq_ignore_ascii_case("VECTOR_DISTANCE"))
-                    && matches!(self.peek(), Tok::LParen)
-                {
+                if k.eq_ignore_ascii_case("VECTOR_DISTANCE") && matches!(self.peek(), Tok::LParen) {
+                    self.bump();
+                    let (var, _) = self.parse_var_with_prop()?;
+                    self.expect_tok(Tok::RParen, ")")?;
+                    return Ok(Expr::VectorDistance { variable: var });
+                }
+                if k.eq_ignore_ascii_case("VECTOR_SCORE") && matches!(self.peek(), Tok::LParen) {
                     self.bump();
                     let (var, _) = self.parse_var_with_prop()?;
                     self.expect_tok(Tok::RParen, ")")?;
@@ -1615,10 +1622,16 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
             } else {
                 None
             };
-            let (vector_variable, vector_distances, vector_candidates) = match vector_pred {
-                Some((var, distances, candidates)) => (Some(var), distances, Some(candidates)),
-                None => (None, HashMap::new(), None),
-            };
+            let (vector_variable, vector_distances, vector_scores, vector_candidates) =
+                match vector_pred {
+                    Some(predicate) => (
+                        Some(predicate.variable),
+                        predicate.distances,
+                        predicate.scores,
+                        Some(predicate.candidates),
+                    ),
+                    None => (None, HashMap::new(), HashMap::new(), None),
+                };
             let (tag_variable, tag_ids) = if let Some(where_) = &m.where_ {
                 match extract_tag_match(storage, where_, &m.patterns)? {
                     Some((var, ids)) => (Some(var), ids),
@@ -1702,6 +1715,9 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
                     if let Some(id) = row_node_id(row, var) {
                         if let Some(&distance) = vector_distances.get(&id) {
                             row.insert("__vector_distance__".into(), Value::from(distance as f64));
+                        }
+                        if let Some(&score) = vector_scores.get(&id) {
+                            row.insert("__vector_score__".into(), Value::from(score as f64));
                         }
                     }
                 }
@@ -1849,7 +1865,12 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
 /// and return `(variable, rowids, scores_by_rowid)`. Returns `None` if no
 /// text_match.
 type TextMatchPredicate = (String, Vec<i64>, HashMap<i64, f32>);
-type VectorNnPredicate = (String, HashMap<i64, f32>, HashSet<i64>);
+struct VectorNnPredicate {
+    variable: String,
+    distances: HashMap<i64, f32>,
+    scores: HashMap<i64, f32>,
+    candidates: HashSet<i64>,
+}
 type TagMatchPredicate = (String, HashSet<i64>);
 
 fn extract_text_match(
@@ -2027,7 +2048,8 @@ fn collect_tag_matches<'a>(e: &'a Expr, conjunctive: bool, out: &mut Vec<&'a Exp
 }
 
 /// Extract a `vector_nn(variable.property, query, k)` predicate, run the ANN
-/// (or exact fallback) search, and return `(variable, distances, candidates)`.
+/// (or exact fallback) search, and return distances, similarity scores, and the
+/// candidate rowid set.
 fn extract_vector_nn(
     storage: &Storage,
     where_: &Expr,
@@ -2051,13 +2073,14 @@ fn extract_vector_nn(
         ))
     })?;
     if *k <= 0 {
-        return Ok(Some((variable.clone(), HashMap::new(), HashSet::new())));
+        return Ok(Some(VectorNnPredicate {
+            variable: variable.clone(),
+            distances: HashMap::new(),
+            scores: HashMap::new(),
+            candidates: HashSet::new(),
+        }));
     }
-    let label = label_for_variable(patterns, variable).ok_or_else(|| {
-        Error::Query(format!(
-            "vector_nn requires a labeled node; '{variable}' has no label"
-        ))
-    })?;
+    let label = label_for_variable(patterns, variable);
     let value = eval(query, &Row::new());
     if value.is_null() {
         return Err(Error::Query(
@@ -2066,10 +2089,43 @@ fn extract_vector_nn(
         ));
     }
     let vector = crate::vector::VectorValue::from_json(&value)?;
-    let results = storage.vector_search(&label, &property, &vector, *k as usize)?;
+    let (results, metric) = match label.as_deref() {
+        Some(label) => match storage.find_vector_index(label, &property)? {
+            Some(meta) => {
+                let metric = meta.config()?.metric;
+                (
+                    storage.vector_search(label, &property, &vector, *k as usize)?,
+                    metric,
+                )
+            }
+            None => (
+                storage.exact_vector_search(
+                    label,
+                    &property,
+                    &vector,
+                    *k as usize,
+                    Distance::L2,
+                )?,
+                Distance::L2,
+            ),
+        },
+        None => (
+            storage.exact_vector_search("", &property, &vector, *k as usize, Distance::L2)?,
+            Distance::L2,
+        ),
+    };
     let distances: HashMap<i64, f32> = results.iter().copied().collect();
+    let scores: HashMap<i64, f32> = results
+        .iter()
+        .map(|(id, distance)| (*id, similarity_score(*distance, metric)))
+        .collect();
     let candidates: HashSet<i64> = results.into_iter().map(|(id, _)| id).collect();
-    Ok(Some((variable.clone(), distances, candidates)))
+    Ok(Some(VectorNnPredicate {
+        variable: variable.clone(),
+        distances,
+        scores,
+        candidates,
+    }))
 }
 
 fn find_vector_nn(e: &Expr) -> Option<&Expr> {
@@ -2649,10 +2705,18 @@ fn eval(e: &Expr, row: &Row) -> Value {
             }
             Value::from(0.0f64)
         }
-        Expr::VectorScore { variable } => {
+        Expr::VectorDistance { variable } => {
             let _ = variable;
             if let Some(distance) = row.get("__vector_distance__") {
                 distance.clone()
+            } else {
+                Value::Null
+            }
+        }
+        Expr::VectorScore { variable } => {
+            let _ = variable;
+            if let Some(score) = row.get("__vector_score__") {
+                score.clone()
             } else {
                 Value::Null
             }

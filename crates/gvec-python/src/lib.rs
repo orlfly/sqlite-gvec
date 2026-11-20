@@ -16,7 +16,7 @@
 //! Import from Python as `from gvec import Database, Vector, Distance`.
 
 use gvec::{
-    Database as RustDatabase, Distance as CoreDistance, Graph as RustGraph, TagIndexMeta,
+    Database as RustDatabase, Distance as CoreDistance, Graph as RustGraph, NodeId, TagIndexMeta,
     VectorIndexMeta, VectorValue,
 };
 use pyo3::conversion::IntoPyObjectExt;
@@ -302,6 +302,70 @@ impl Graph {
         self.inner_graph
             .vector_count(label, property)
             .map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (label = None, property = None))]
+    fn vector_row_count(
+        &self,
+        label: Option<&str>,
+        property: Option<&str>,
+    ) -> PyResult<usize> {
+        self.inner_graph
+            .vector_row_count(label, property)
+            .map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (label = None, property = None))]
+    fn vector_rows(
+        &self,
+        py: Python<'_>,
+        label: Option<&str>,
+        property: Option<&str>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let rows = self
+            .inner_graph
+            .vector_rows(label, property)
+            .map_err(to_pyerr)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let dict = PyDict::new(py);
+            dict.set_item("node_id", row.node_id)?;
+            dict.set_item("property", row.property)?;
+            dict.set_item("vector", json_to_py(py, &row.vector.to_json())?)?;
+            out.push(dict.into_py_any(py)?);
+        }
+        Ok(out)
+    }
+
+    fn set_vector_row(
+        &self,
+        node_id: i64,
+        property: &str,
+        vector: PyRef<'_, Vector>,
+    ) -> PyResult<()> {
+        self.inner_graph
+            .set_vector_row(
+                NodeId(node_id),
+                property,
+                &VectorValue::F32(vector.values.clone()),
+            )
+            .map_err(to_pyerr)
+    }
+
+    fn node_vector(
+        &self,
+        py: Python<'_>,
+        node_id: i64,
+        property: &str,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        match self
+            .inner_graph
+            .node_vector(NodeId(node_id), property)
+            .map_err(to_pyerr)?
+        {
+            Some(vector) => Ok(Some(json_to_py(py, &vector.to_json())?)),
+            None => Ok(None),
+        }
     }
 
     /// ANN search using the configured index, falling back to exact L2 scan.

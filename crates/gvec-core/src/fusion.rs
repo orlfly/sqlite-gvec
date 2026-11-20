@@ -15,14 +15,16 @@ pub fn vector_from_scalar(v: &Value) -> Result<VectorValue> {
     VectorValue::from_json(v)
 }
 
-/// Extract a node's stored vector (if any) given a property name. Currently a
-/// stub: vectors live in the virtual table, so we always return None here.
-pub fn node_vector(
-    _storage: &Storage,
-    _rowid: i64,
-    _property: &str,
-) -> Result<Option<VectorValue>> {
-    Ok(None)
+/// Extract a node's persisted vector row (or fall back to its JSON property).
+pub fn node_vector(storage: &Storage, rowid: i64, property: &str) -> Result<Option<VectorValue>> {
+    if let Some(row) = storage.get_vector_row(crate::ids::NodeId(rowid), property)? {
+        return Ok(Some(row.vector));
+    }
+    let node = storage.get_node(crate::ids::NodeId(rowid))?;
+    match crate::property::resolve(&node.properties, property) {
+        Some(value) if !value.is_null() => Ok(Some(VectorValue::from_json(value)?)),
+        _ => Ok(None),
+    }
 }
 
 /// Convenience: KNN across an in-memory collection, used by tests and the

@@ -63,10 +63,13 @@ g.create_vector_index("Doc", "embedding", "hnsw", Some("l2"), None).unwrap();
 let rs = g.run(r#"
     MATCH (n:Doc)
     WHERE vector_nn(n.embedding, [0.0, 0.0], 2)
-    RETURN n.title AS title, vector_distance(n) AS distance
+    RETURN n.title AS title, vector_distance(n) AS distance,
+           vector_score(n) AS score
+    ORDER BY vector_score(n) DESC
 "#).unwrap();
 assert_eq!(rs.rows[0][0], "origin");
 assert_eq!(rs.rows[1][0], "near");
+assert!(rs.rows[0][2].as_f64().unwrap() > rs.rows[1][2].as_f64().unwrap());
 
 // Or create the index with query-language DDL
 g.run(r#"CREATE VECTOR INDEX ON :Doc(embedding)
@@ -180,14 +183,38 @@ Graph limitation summary:
   targets an unindexed property, and as the recall oracle in tests.
 
 Vectors and index definitions are persisted in the graph's shadow tables
-(`{graph}_vector_indexes`, `{graph}_vectors`). ANN structures are cached and
-rebuilt deterministically on demand after writes, so a restart never requires
-an external sidecar file.
+(`{graph}_vector_rows`, `{graph}_vector_indexes`, `{graph}_vectors`). ANN
+structures are cached and rebuilt deterministically on demand after writes, so
+a restart never requires an external sidecar file.
+
+### Persistent vector rows
+
+Every numeric array or typed vector property is also stored as a row in
+`{graph}_vector_rows`, keyed by `(node_id, property)`. This makes KNN and
+`vector_nn` work before an index is created and keeps embeddings available to
+`fusion::node_vector`:
+
+```rust
+use gvec::{Distance, VectorValue};
+
+let hits = g.exact_vector_search("Doc", "embedding", &query, 5, Distance::L2)?;
+println!("{:?}", g.vector_rows(Some("Doc"), Some("embedding"))?);
+
+// Sidecar embeddings are first-class too.
+g.set_vector_row(node_id, "embedding", &VectorValue::F32(vec![0.1, 0.2]))?;
+let v = g.node_vector(node_id, "embedding")?;
+```
+
+`vector_distance(v)` returns the metric distance (lower is better).
+`vector_score(v)` returns a descending similarity: `1/(1+d)` for L2, `1-d`
+for cosine, and `-d` for inner product. Use `ORDER BY vector_score(v) DESC`
+for "most similar first". `vector_nn` still defaults to ascending distance.
 
 ## Benchmarks
 
 ```bash
 cargo run --release -p gvec --example vector_bench
+cargo run --release -p gvec --example vector_rows_bench
 cargo run --release -p gvec --example graph_bench
 ```
 
@@ -240,6 +267,24 @@ high-dimensional vectors are the adversarial case: `ef_search` trades recall
 for latency at query time without rebuilding (`HnswIndex::search_with_ef`).
 Binary Hamming space has many distance ties and is the weakest case for the
 current graph heuristic.
+
+### Persistent vector rows
+
+`vector_rows_bench` stores every vector through the node write path, then
+compares exact KNN over persisted rows with HNSW over the same data.
+
+| Case (20k rows, 64d f32) | Time |
+| --- | ---: |
+| node + vector row insert | 21.7 µs/node (0.43 s total) |
+| load all rows (`vector_rows`) | 99.8 ms |
+| exact KNN, no index p50/p95 | 113.1 / 117.5 ms |
+| HNSW build | 0.77 s |
+| HNSW KNN p50/p95 | 0.26 / 0.45 ms |
+| HNSW recall@10 | 1.000 |
+
+Exact KNN scans and decodes every row on each call, so it is intended for
+small graphs or migration fallback. Create an HNSW/IVF index for interactive
+retrieval; rows remain the source of truth used to rebuild it.
 
 ## Full-text search
 

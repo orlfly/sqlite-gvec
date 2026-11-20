@@ -340,6 +340,27 @@ pub fn distance_metric(a: &VectorValue, b: &VectorValue, d: Distance) -> f32 {
     }
 }
 
+/// Convert an ascending distance into a descending similarity score.
+///
+/// - L2 / Hamming: `1 / (1 + d)`, in `(0, 1]`.
+/// - Cosine: `1 - d`, i.e. cosine similarity (can be negative).
+/// - Inner product: `-d`, i.e. the raw dot product (larger is better).
+pub fn similarity_score(distance: f32, metric: Distance) -> f32 {
+    match metric {
+        Distance::L2 => 1.0 / (1.0 + distance.max(0.0)),
+        Distance::Cosine => 1.0 - distance,
+        Distance::InnerProduct => -distance,
+    }
+}
+
+/// A persisted vector attached to `(node_id, property)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorRow {
+    pub node_id: i64,
+    pub property: String,
+    pub vector: VectorValue,
+}
+
 fn dot_f32(x: &[f32], y: &[f32]) -> f32 {
     x.iter().zip(y).map(|(a, b)| a * b).sum()
 }
@@ -469,5 +490,15 @@ mod tests {
         assert_eq!(res[0].0, 3);
         assert_eq!(res[1].0, 1);
         assert!(res[0].1 < res[1].1);
+    }
+
+    #[test]
+    fn similarity_score_is_descending() {
+        assert!((similarity_score(0.0, Distance::L2) - 1.0).abs() < 1e-6);
+        assert!((similarity_score(3.0, Distance::L2) - 0.25).abs() < 1e-6);
+        assert!((similarity_score(0.25, Distance::Cosine) - 0.75).abs() < 1e-6);
+        assert!((similarity_score(-2.5, Distance::InnerProduct) - 2.5).abs() < 1e-6);
+        // Larger distances must never produce larger L2 scores.
+        assert!(similarity_score(10.0, Distance::L2) < similarity_score(1.0, Distance::L2));
     }
 }
