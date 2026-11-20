@@ -1558,4 +1558,282 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("same variable"));
     }
+
+    // ---- Graph traversal correctness ----
+
+    #[test]
+    fn graph_variable_length_zero_and_remaining_segment() {
+        use gvec_core::ids::NodeId;
+
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(
+            r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})
+                     -[:KNOWS]->(c:Person {name: "C"})-[:LIKES]->(d:Person {name: "D"})"#,
+        )
+        .unwrap();
+        g.storage
+            .create_edge(NodeId(1), NodeId(4), Some("LIKES"), &json!({}))
+            .unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})-[:KNOWS*0..2]->(b)-[:LIKES]->(c:Person {name: "D"})
+                   RETURN b.name AS via"#,
+            )
+            .unwrap();
+        let mut via: Vec<String> = rs
+            .rows
+            .iter()
+            .map(|r| r[0].as_str().unwrap_or("").to_string())
+            .collect();
+        via.sort();
+        assert_eq!(
+            via,
+            vec!["A".to_string(), "C".to_string()],
+            "zero-length paths and remaining segments must both work"
+        );
+    }
+
+    #[test]
+    fn graph_variable_length_filters_destination_node() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(
+            r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})
+                     -[:KNOWS]->(c:Company {name: "C"})"#,
+        )
+        .unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})-[:KNOWS*1..2]->(b:Person)
+                   RETURN b.name AS name"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("B")]]);
+    }
+
+    #[test]
+    fn graph_fixed_pattern_filters_later_node_properties() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})"#)
+            .unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})
+                   RETURN b.name AS name"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("B")]]);
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "Nope"})
+                   RETURN b.name AS name"#,
+            )
+            .unwrap();
+        assert!(rs.rows.is_empty());
+    }
+
+    #[test]
+    fn graph_multi_label_requires_all_labels() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Person:Admin {name: "admin"})"#).unwrap();
+        g.run(r#"CREATE (b:Person {name: "member"})"#).unwrap();
+        let rs = g
+            .run(r#"MATCH (n:Person:Admin) RETURN n.name AS name"#)
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("admin")]]);
+    }
+
+    #[test]
+    fn graph_undirected_self_loop_is_not_duplicated() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        let id = g
+            .storage
+            .create_node(&["Node".into()], &json!({"name": "a"}))
+            .unwrap();
+        g.storage
+            .create_edge(id, id, Some("LOOP"), &json!({}))
+            .unwrap();
+        let rs = g
+            .run(r#"MATCH (a:Node)-[:LOOP]-(b) RETURN b.name AS name"#)
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")]]);
+    }
+
+    #[test]
+    fn graph_variable_length_relationship_variable_is_an_array() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(
+            r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})
+                     -[:KNOWS]->(c:Person {name: "C"})"#,
+        )
+        .unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})-[r:KNOWS*1..2]->(b)
+                   RETURN b.name AS name, r AS edges"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        for row in &rs.rows {
+            let edges = row[1]
+                .as_array()
+                .expect("relationship variable is an array");
+            assert!(!edges.is_empty());
+        }
+    }
+
+    #[test]
+    fn graph_unbounded_variable_length_terminates_on_cycle() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(
+            r#"CREATE (a:Node {name: "A"})-[:NEXT]->(b:Node {name: "B"})
+                     -[:NEXT]->(c:Node {name: "C"})-[:NEXT]->(a)"#,
+        )
+        .unwrap();
+        // CREATE cannot reference an existing variable yet, so build the
+        // closing edge through the storage API.
+        g.storage
+            .create_edge(
+                gvec_core::ids::NodeId(3),
+                gvec_core::ids::NodeId(1),
+                Some("NEXT"),
+                &json!({}),
+            )
+            .unwrap();
+
+        let rs = g
+            .run(r#"MATCH (a:Node {name: "A"})-[:NEXT*1..]->(b) RETURN b.name AS name"#)
+            .unwrap();
+        assert_eq!(rs.rows.len(), 4, "unbounded paths must stop on edge reuse");
+    }
+
+    #[test]
+    fn graph_second_match_reuses_bound_variable() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})"#)
+            .unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})
+                   MATCH (a)-[:KNOWS]->(b)
+                   RETURN a.name AS a, b.name AS b"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("A"), json!("B")]]);
+    }
+
+    #[test]
+    fn graph_optional_match_after_match_keeps_row() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})"#)
+            .unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})
+                   OPTIONAL MATCH (a)-[:MISSING]->(b)
+                   RETURN a.name AS a, b.name AS b"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("A"), json!(null)]]);
+
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})
+                   OPTIONAL MATCH (a)-[:KNOWS]->(b)
+                   RETURN a.name AS a, b.name AS b"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("A"), json!("B")]]);
+    }
+
+    #[test]
+    fn graph_multi_type_relationship() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Person {name: "A"})-[:KNOWS]->(b:Person {name: "B"})"#)
+            .unwrap();
+        g.run(r#"CREATE (a:Person {name: "A"})-[:LIKES]->(c:Person {name: "C"})"#)
+            .unwrap();
+        g.run(r#"CREATE (a:Person {name: "A"})-[:HATES]->(d:Person {name: "D"})"#)
+            .unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (a:Person {name: "A"})-[:KNOWS|LIKES]->(b)
+                   RETURN b.name AS name ORDER BY name"#,
+            )
+            .unwrap();
+        assert_eq!(
+            rs.rows,
+            vec![vec![json!("B")], vec![json!("C")]],
+            "multi-type patterns must match every listed type and nothing else"
+        );
+    }
+
+    #[test]
+    fn graph_tag_index_accelerates_numeric_inline_property() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        for i in 0..100 {
+            g.storage
+                .create_node(
+                    &["Person".into()],
+                    &json!({"id": i, "name": format!("p{i}")}),
+                )
+                .unwrap();
+        }
+        g.storage
+            .create_node(&["Person".into()], &json!({"id": 200.0, "name": "real"}))
+            .unwrap();
+        g.create_tag_index("Person", "id").unwrap();
+
+        assert_eq!(
+            g.storage.tag_search("Person", "id", "42").unwrap(),
+            vec![43]
+        );
+        assert_eq!(
+            g.storage.tag_search("Person", "id", "200").unwrap(),
+            vec![101]
+        );
+        let rs = g
+            .run(r#"MATCH (n:Person {id: 42}) RETURN n.name AS name"#)
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("p42")]]);
+        let rs = g
+            .run(r#"MATCH (n:Person {id: 200}) RETURN n.name AS name"#)
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("real")]]);
+
+        g.storage
+            .update_node(
+                gvec_core::ids::NodeId(43),
+                &["Person".into()],
+                &json!({"id": 1000, "name": "moved"}),
+            )
+            .unwrap();
+        assert!(g
+            .storage
+            .tag_search("Person", "id", "42")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            g.storage.tag_search("Person", "id", "1000").unwrap(),
+            vec![43]
+        );
+        let rs = g
+            .run(r#"MATCH (n:Person {id: 1000}) RETURN n.name AS name"#)
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("moved")]]);
+    }
 }

@@ -421,6 +421,10 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 Tok::Colon
             }
+            '|' => {
+                self.bump();
+                Tok::Pipe
+            }
             '.' => {
                 if self.at("..") {
                     self.pos += 2;
@@ -1046,12 +1050,21 @@ impl Parser {
             let mut vlen = None;
             if matches!(self.peek(), Tok::Star) {
                 self.bump();
-                let lo = self.parse_int_or_wildcard()?;
-                let mut hi = None;
-                if matches!(self.peek(), Tok::DotDot) {
+                // `*` = 1..inf, `*3` = exactly 3, `*..3` = 1..3,
+                // `*2..` = 2..inf, `*0..2` = 0..2.
+                let lo = match self.peek() {
+                    Tok::DotDot | Tok::RBracket => 1,
+                    _ => self.parse_int_or_wildcard()?,
+                };
+                let hi = if matches!(self.peek(), Tok::DotDot) {
                     self.bump();
-                    hi = Some(self.parse_int_or_wildcard()?);
-                }
+                    match self.peek() {
+                        Tok::RBracket => None,
+                        _ => Some(self.parse_int_or_wildcard()?),
+                    }
+                } else {
+                    Some(lo)
+                };
                 vlen = Some((lo, hi));
             }
             self.expect_tok(Tok::RBracket, "]")?;
@@ -2179,10 +2192,67 @@ fn execute_match(
     constraints: CandidateConstraints<'_>,
 ) -> Result<Vec<Row>> {
     let first_node = &p.segments[0].node;
+    // If a previous MATCH already bound this variable, continue from those
+    // rows instead of scanning every node and overwriting the binding. This is
+    // what makes `MATCH ... MATCH ...` and `MATCH ... OPTIONAL MATCH ...` work.
+    if base_rows
+        .iter()
+        .any(|row| row.contains_key(&first_node.variable))
+    {
+        let mut out = Vec::new();
+        for base in base_rows {
+            let Some(id) = row_node_id(base, &first_node.variable) else {
+                continue;
+            };
+            let Ok(node) = storage.get_node(NodeId(id)) else {
+                continue;
+            };
+            if !node_matches(&node, first_node) {
+                continue;
+            }
+            match extend_pattern(storage, &p.segments[1..], node.id, base) {
+                Some(rows) => out.extend(rows),
+                None => {
+                    if optional {
+                        out.push(base.clone());
+                    }
+                }
+            }
+        }
+        if optional && out.is_empty() && !base_rows.is_empty() {
+            out.extend(base_rows.iter().cloned());
+        }
+        return Ok(out);
+    }
     // Pick the smallest predicate rowid set targeting this variable, then fetch
     // only those nodes instead of materializing every labeled node. The other
     // constraints are applied below.
-    let mut smallest: Option<&HashSet<i64>> = None;
+    // An exact tag index over a scalar property turns an inline anchor such as
+    // `MATCH (n:Person {id: 42})` into a direct index lookup instead of a label
+    // scan. Only integer and string literals are used here so the tag text
+    // representation is unambiguous.
+    let mut indexed_ids: Option<HashSet<i64>> = None;
+    if let Some(label) = first_node.labels.first() {
+        for (key, expr) in &first_node.properties {
+            let Expr::Literal(value) = expr else {
+                continue;
+            };
+            let Some(tag) = inline_property_tag(value) else {
+                continue;
+            };
+            if storage.find_tag_index(label, key)?.is_none() {
+                continue;
+            }
+            let ids: HashSet<i64> = storage.tag_search(label, key, &tag)?.into_iter().collect();
+            if indexed_ids
+                .as_ref()
+                .is_none_or(|current| ids.len() < current.len())
+            {
+                indexed_ids = Some(ids);
+            }
+        }
+    }
+    let mut smallest: Option<&HashSet<i64>> = indexed_ids.as_ref();
     for constraint in constraints.iter() {
         if let Some(ids) = constraint.ids_for(&first_node.variable) {
             if smallest.is_none_or(|current| ids.len() < current.len()) {
@@ -2193,20 +2263,24 @@ fn execute_match(
     let mut nodes: Vec<Node> = if let Some(ids) = smallest {
         let mut nodes = storage.list_nodes_by_ids(ids)?;
         if !first_node.labels.is_empty() {
-            nodes.retain(|n| first_node.labels.iter().any(|l| n.labels.contains(l)));
+            nodes.retain(|n| first_node.labels.iter().all(|l| n.labels.contains(l)));
         }
         nodes
-    } else if first_node.labels.is_empty() {
-        storage.list_nodes_by_label("")?
     } else {
-        let mut all: Vec<Node> = Vec::new();
-        for lbl in &first_node.labels {
-            for n in storage.list_nodes_by_label(lbl)? {
-                all.push(n);
-            }
+        let sql_props: Vec<(String, Value)> = first_node
+            .properties
+            .iter()
+            .filter_map(|(key, expr)| match expr {
+                Expr::Literal(value) => Some((key.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
+        let label = first_node.labels.first().map(String::as_str).unwrap_or("");
+        let mut all = storage.list_nodes_by_label_and_properties(label, &sql_props)?;
+        if first_node.labels.len() > 1 {
+            all.retain(|n| first_node.labels.iter().all(|l| n.labels.contains(l)));
         }
         all.sort_by_key(|n| n.id.0);
-        all.dedup_by_key(|n| n.id.0);
         all
     };
     for constraint in constraints.iter() {
@@ -2265,6 +2339,14 @@ fn properties_match(props: &Value, filters: &[(String, Expr)]) -> bool {
     })
 }
 
+fn inline_property_tag(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) if n.is_i64() || n.is_u64() => crate::tag::number_tag(n),
+        _ => None,
+    }
+}
+
 fn json_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
@@ -2286,108 +2368,71 @@ fn extend_pattern(
         .as_ref()
         .expect("non-first segment must have edge");
     let next_node = &segs[0].node;
-    let candidates = match edge_pat.direction {
-        Direction::Out => storage.list_edges(Some(anchor), None).unwrap_or_default(),
-        Direction::In => storage.list_edges(None, Some(anchor)).unwrap_or_default(),
-        Direction::Either => {
-            let mut v = storage.list_edges(Some(anchor), None).unwrap_or_default();
-            v.extend(storage.list_edges(None, Some(anchor)).unwrap_or_default());
-            v
-        }
-    };
     let mut out = Vec::new();
-    for edge in candidates {
-        if !edge_pat.types.is_empty() {
-            let t = edge.edge_type.clone().unwrap_or_default();
-            if !edge_pat.types.iter().any(|x| x == &t) {
-                continue;
-            }
-        }
-        let other = if edge.source == anchor {
-            edge.target
-        } else {
-            edge.source
-        };
-        if !next_node.labels.is_empty() {
-            let node = storage.get_node(other).ok()?;
-            if !next_node
-                .labels
-                .iter()
-                .any(|l| node.labels.iter().any(|x| x == l))
-            {
-                continue;
-            }
-        }
-        let mut new_row = row.clone();
-        if let Some(var) = &edge_pat.variable {
-            new_row.insert(var.clone(), edge_to_value(edge.clone()));
-        }
-        new_row.insert(
-            next_node.variable.clone(),
-            node_to_value(storage.get_node(other).ok()?),
-        );
-        if let Some((lo, hi)) = edge_pat.variable_length {
-            let mut frontier: Vec<(Row, NodeId, usize)> = vec![(new_row.clone(), other, 1)];
-            let mut accepted: Vec<Row> = Vec::new();
-            if lo == 0 {
-                accepted.push(new_row.clone());
-            }
-            while let Some((cur_row, cur_anchor, depth)) = frontier.pop() {
-                if depth >= lo {
-                    // Bind the destination variable to the current node at this depth
-                    let mut final_row = cur_row.clone();
-                    final_row.insert(
-                        next_node.variable.clone(),
-                        node_to_value(storage.get_node(cur_anchor).ok()?),
-                    );
-                    accepted.push(final_row);
-                }
-                if depth >= hi.unwrap_or(usize::MAX) {
-                    continue;
-                }
-                let next_edges = match edge_pat.direction {
-                    Direction::Out => storage
-                        .list_edges(Some(cur_anchor), None)
-                        .unwrap_or_default(),
-                    Direction::In => storage
-                        .list_edges(None, Some(cur_anchor))
-                        .unwrap_or_default(),
-                    Direction::Either => {
-                        let mut v = storage
-                            .list_edges(Some(cur_anchor), None)
-                            .unwrap_or_default();
-                        v.extend(
-                            storage
-                                .list_edges(None, Some(cur_anchor))
-                                .unwrap_or_default(),
-                        );
-                        v
-                    }
-                };
-                for e in next_edges {
-                    // Filter by edge type on EVERY hop, not just the first
-                    if !edge_pat.types.is_empty() {
-                        let t = e.edge_type.clone().unwrap_or_default();
-                        if !edge_pat.types.iter().any(|x| x == &t) {
-                            continue;
+    if let Some((lo, hi)) = edge_pat.variable_length {
+        // Depth-first enumeration of relationship-unique paths. `lo == 0`
+        // includes the zero-length path, and every accepted endpoint must
+        // satisfy the destination node's labels and inline properties.
+        let mut stack: Vec<(Row, NodeId, Vec<crate::edge::Edge>, HashSet<i64>)> =
+            vec![(row.clone(), anchor, Vec::new(), HashSet::new())];
+        while let Some((cur_row, cur_node, path_edges, visited)) = stack.pop() {
+            let depth = path_edges.len();
+            if depth >= lo {
+                if let Ok(node) = storage.get_node(cur_node) {
+                    if node_matches(&node, next_node) {
+                        let mut final_row = cur_row.clone();
+                        if let Some(var) = &edge_pat.variable {
+                            final_row.insert(
+                                var.clone(),
+                                Value::Array(
+                                    path_edges
+                                        .iter()
+                                        .map(|edge| edge_to_value(edge.clone()))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        final_row.insert(next_node.variable.clone(), node_to_value(node));
+                        if let Some(rows) =
+                            extend_pattern(storage, &segs[1..], cur_node, &final_row)
+                        {
+                            out.extend(rows);
                         }
                     }
-                    let next_id = if e.source == cur_anchor {
-                        e.target
-                    } else {
-                        e.source
-                    };
-                    let mut deeper = cur_row.clone();
-                    if let Some(var) = &edge_pat.variable {
-                        deeper.insert(format!("{}_d{}", var, depth), edge_to_value(e));
-                    }
-                    frontier.push((deeper, next_id, depth + 1));
                 }
             }
-            for r in accepted {
-                out.push(r);
+            if depth >= hi.unwrap_or(usize::MAX) {
+                continue;
             }
-        } else {
+            for edge in candidate_edges(storage, edge_pat.direction, cur_node) {
+                if !edge_type_matches(&edge, &edge_pat.types) || visited.contains(&edge.id.0) {
+                    continue;
+                }
+                let next_id = other_endpoint(&edge, cur_node);
+                let mut next_path = path_edges.clone();
+                next_path.push(edge);
+                let mut next_visited = visited.clone();
+                next_visited.insert(next_path.last().expect("just pushed").id.0);
+                stack.push((cur_row.clone(), next_id, next_path, next_visited));
+            }
+        }
+    } else {
+        for edge in candidate_edges(storage, edge_pat.direction, anchor) {
+            if !edge_type_matches(&edge, &edge_pat.types) {
+                continue;
+            }
+            let other = other_endpoint(&edge, anchor);
+            let Ok(node) = storage.get_node(other) else {
+                continue;
+            };
+            if !node_matches(&node, next_node) {
+                continue;
+            }
+            let mut new_row = row.clone();
+            if let Some(var) = &edge_pat.variable {
+                new_row.insert(var.clone(), edge_to_value(edge.clone()));
+            }
+            new_row.insert(next_node.variable.clone(), node_to_value(node));
             if let Some(rows) = extend_pattern(storage, &segs[1..], other, &new_row) {
                 out.extend(rows);
             }
@@ -2398,6 +2443,49 @@ fn extend_pattern(
     } else {
         Some(out)
     }
+}
+
+fn candidate_edges(
+    storage: &Storage,
+    direction: Direction,
+    anchor: NodeId,
+) -> Vec<crate::edge::Edge> {
+    match direction {
+        Direction::Out => storage.list_edges(Some(anchor), None).unwrap_or_default(),
+        Direction::In => storage.list_edges(None, Some(anchor)).unwrap_or_default(),
+        Direction::Either => {
+            let mut edges = storage.list_edges(Some(anchor), None).unwrap_or_default();
+            edges.extend(storage.list_edges(None, Some(anchor)).unwrap_or_default());
+            edges.sort_by_key(|edge| edge.id.0);
+            edges.dedup_by_key(|edge| edge.id.0);
+            edges
+        }
+    }
+}
+
+fn other_endpoint(edge: &crate::edge::Edge, anchor: NodeId) -> NodeId {
+    if edge.source == anchor {
+        edge.target
+    } else {
+        edge.source
+    }
+}
+
+fn edge_type_matches(edge: &crate::edge::Edge, types: &[String]) -> bool {
+    types.is_empty()
+        || edge
+            .edge_type
+            .as_ref()
+            .is_some_and(|edge_type| types.iter().any(|t| t == edge_type))
+}
+
+fn node_matches(node: &Node, pattern: &NodePattern) -> bool {
+    pattern
+        .labels
+        .iter()
+        .all(|label| node.labels.iter().any(|node_label| node_label == label))
+        && (pattern.properties.is_empty()
+            || properties_match(&node.properties, &pattern.properties))
 }
 
 fn node_to_value(n: Node) -> Value {

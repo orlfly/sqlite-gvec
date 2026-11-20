@@ -121,6 +121,22 @@ impl Storage {
         )?;
         self.exec.execute(
             &format!(
+                "CREATE INDEX IF NOT EXISTS {}_edges_source ON {}(source)",
+                self.prefix,
+                self.tbl("edges")
+            ),
+            &[],
+        )?;
+        self.exec.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {}_edges_target ON {}(target)",
+                self.prefix,
+                self.tbl("edges")
+            ),
+            &[],
+        )?;
+        self.exec.execute(
+            &format!(
                 "CREATE TABLE IF NOT EXISTS {chunks} (
                 chunk_id INTEGER PRIMARY KEY,
                 size INTEGER NOT NULL,
@@ -258,6 +274,73 @@ impl Storage {
                 "SELECT id, labels, properties FROM {} {}",
                 self.tbl("nodes"),
                 where_sql
+            ),
+            &params,
+        )?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = json_to_i64(&row[0])?;
+            let labels = json_to_string(&row[1])?;
+            let properties = json_to_string(&row[2])?;
+            out.push(Node {
+                id: NodeId(id),
+                labels: serde_json::from_str(&labels)?,
+                properties: serde_json::from_str(&properties)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// List nodes by label and top-level scalar properties, pushing the
+    /// property comparisons into SQLite's JSON1 extractor. The caller still
+    /// performs the exact Rust-side match, so this is only a prefilter. It
+    /// avoids materializing and JSON-decoding every node of a label when the
+    /// pattern has a selective inline property such as `{id: 42}`.
+    pub fn list_nodes_by_label_and_properties(
+        &self,
+        label: &str,
+        properties: &[(String, Value)],
+    ) -> Result<Vec<Node>> {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<SqlValue> = Vec::new();
+        if !label.is_empty() {
+            clauses.push("labels LIKE ?1".to_string());
+            params.push(SqlValue::Text(format!("%\"{}\"%", label)));
+        }
+        let mut next = params.len() + 1;
+        for (key, value) in properties {
+            // Only top-level keys with a scalar value can be narrowed safely.
+            // The Rust filter handles nested paths, arrays, objects, and keys
+            // whose JSON path would need escaping.
+            if key.is_empty()
+                || key.contains('.')
+                || key.contains('"')
+                || key.contains('\\')
+                || value.is_array()
+                || value.is_object()
+            {
+                continue;
+            }
+            let path = SqlValue::Text(format!("$.\"{key}\""));
+            if value.is_null() {
+                clauses.push(format!("json_extract(properties, ?{next}) IS NULL"));
+                params.push(path);
+                next += 1;
+            } else {
+                clauses.push(format!("json_extract(properties, ?{next}) = ?{}", next + 1));
+                params.push(path);
+                params.push(crate::sql::from_json(value));
+                next += 2;
+            }
+        }
+        if clauses.is_empty() {
+            return self.list_nodes_by_label(label);
+        }
+        let rows = self.exec.query_all_json(
+            &format!(
+                "SELECT id, labels, properties FROM {} WHERE {}",
+                self.tbl("nodes"),
+                clauses.join(" AND ")
             ),
             &params,
         )?;

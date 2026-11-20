@@ -8,7 +8,8 @@ database that runs on top of any SQLite build. It exposes:
   int8, and binary vectors
 - A Cypher-like graph query language (`CREATE`, `MATCH`, `OPTIONAL MATCH`,
   `WHERE`, `RETURN`, `SET`, `DELETE`, `ORDER BY`, `SKIP`, `LIMIT`) including
-  directed, undirected, and variable-length `[r*1..3]` patterns
+  directed, undirected, multi-type `[:A|B]`, and variable-length `[r*1..3]`
+  patterns, plus consecutive `MATCH` clauses that reuse bound variables
 - Vector-anchored graph traversal and hybrid retrieval via real `vector_nn(...)`
   and `text_match(...)` rowid-set constraints
 - Full-text search through SQLite FTS5 with BM25 ranking (`CREATE TEXT INDEX`,
@@ -29,7 +30,7 @@ as design inspiration.
 | Crate | Description | Status |
 | --- | --- | --- |
 | `gvec-core` | Storage, HNSW/IVF/Flat indexes, tag indexes, Cypher parser/executor, FTS, fusion | ✅ implemented (29 tests) |
-| `gvec` | In-process Rust binding over `rusqlite` | ✅ implemented (50 tests) |
+| `gvec` | In-process Rust binding over `rusqlite` | ✅ implemented (61 tests) |
 | `gvec-python` | PyO3 Python extension (`gvec._gvec`) | ✅ implemented (smoke tested) |
 | `gvec-extension` | Loadable SQLite extension via `sqlite-loadable` | ✅ entry point + scalars (1 test) |
 
@@ -92,6 +93,80 @@ let rs = g.run(r#"MATCH (n:Doc) WHERE tag_match(n.tags, "database") RETURN n.tit
 assert_eq!(rs.rows[0][0], "origin");
 ```
 
+## Graph queries
+
+`g.run()` executes a Cypher-like subset directly against the graph shadow tables.
+Nodes and relationships can be created in one pattern:
+
+```rust
+g.run(r#"CREATE (a:Person {id: 1, name: "Alice"})-[:KNOWS]->(b:Person {id: 2, name: "Bob"})"#)?;
+
+let rs = g.run(r#"
+    MATCH (a:Person {name: "Alice"})-[:KNOWS]->(b)
+    RETURN b.name AS name
+"#)?;
+assert_eq!(rs.rows[0][0], "Bob");
+```
+
+Fixed patterns can chain arbitrarily and may bind the relationship:
+
+```rust
+g.run(r#"
+    MATCH (a:Person {id: 1})-[r:KNOWS]->(b)-[:KNOWS]->(c)
+    RETURN c.name AS name
+"#)?;
+```
+
+Variable-length patterns enumerate relationship-unique paths. `*` is `1..inf`,
+`*3` is exactly three, `*..3` is `1..3`, `*2..` is `2..inf`, and `*0..2` is
+`0..2`. Destination labels and inline properties are checked at every accepted
+endpoint, and a relationship variable binds to an array of edge objects:
+
+```rust
+let rs = g.run(r#"
+    MATCH (a:Person {id: 1})-[path:KNOWS*1..3]->(b:Person)
+    RETURN b.name AS name, path
+"#)?;
+```
+
+Undirected traversal (`-[:KNOWS]-`) and multi-type relationships
+(`-[:KNOWS|LIKES]->`) are supported. Consecutive `MATCH` clauses reuse existing
+bindings instead of rescanning, so `OPTIONAL MATCH` works as expected:
+
+```rust
+let rs = g.run(r#"
+    MATCH (a:Person {id: 1})
+    OPTIONAL MATCH (a)-[:MANAGES]->(b)
+    RETURN a.name AS person, b.name AS report
+"#)?;
+```
+
+Fixed patterns enumerate paths, so the same endpoint can appear more than once
+when two different paths reach it. Variable-length patterns reject reusing the
+same relationship within one path, which also makes bare `*` terminate on
+cyclic graphs.
+
+An inline scalar anchor such as `MATCH (n:Person {id: 42})` is pushed into
+SQLite as a `json_extract` prefilter. For constant-time anchor lookup, create an
+exact tag index on that property; the planner then resolves the anchor through
+the index:
+
+```rust
+g.create_tag_index("Person", "id")?;
+let rs = g.run(r#"MATCH (n:Person {id: 42}) RETURN n.name AS name"#)?;
+```
+
+Graph limitation summary:
+
+- No `DISTINCT`, `COUNT`, or other aggregation; duplicate path endpoints are
+  returned as separate rows.
+- No `MATCH ... CREATE` / `MERGE`; `CREATE` always inserts the nodes in its
+  pattern.
+- No shortest-path operator. Unbounded variable-length traversal is
+  relationship-unique but still exponential in the worst case.
+- Without a tag index on the anchor property, anchor lookup is a label scan plus
+  a SQL JSON prefilter.
+
 ### Vector index algorithms
 
 - **HNSW** (default): hierarchical navigable small world. Levels are derived
@@ -113,11 +188,40 @@ an external sidecar file.
 
 ```bash
 cargo run --release -p gvec --example vector_bench
+cargo run --release -p gvec --example graph_bench
 ```
 
 The benchmark builds deterministic synthetic datasets, compares against
 brute-force ground truth, and reports build time, p50/p95 query latency, and
 recall@10. Sample run on one Linux x86-64 machine, single-threaded:
+
+### Graph traversal
+
+`graph_bench` builds a directed social graph with four `FOLLOWS` and one `LIKES`
+edge per node, verifies every complete result set against a naive adjacency
+model, and then measures the same 20 anchors. At 50k nodes and 250k edges it
+inserts nodes at 3.8 µs/node and edges at 16.2 µs/edge (61.8k edges/s), uses
+20.69 MB including the `Person.id` tag index, and builds that index in 115 ms.
+
+| Case (50k nodes, 250k edges) | Rows | p50 | p95 |
+| --- | ---: | ---: | ---: |
+| anchor scan, no index | 1 | 23.57 ms | 25.69 ms |
+| anchor via `Person.id` tag index | 1 | 0.035 ms | 0.047 ms |
+| 1-hop out | 4 | 0.084 ms | 0.104 ms |
+| 1-hop in | 4 | 0.086 ms | 0.100 ms |
+| 2-hop fixed | 16 | 0.281 ms | 0.312 ms |
+| 3-hop fixed | 64 | 1.299 ms | 1.672 ms |
+| variable `*1..2` | 20 | 0.292 ms | 0.307 ms |
+| variable `*1..3` | 84 | 1.223 ms | 2.298 ms |
+| undirected 1-hop | 8 | 0.129 ms | 0.146 ms |
+| multi-type 1-hop | 5 | 0.087 ms | 0.140 ms |
+| edge property `r.weight > 0.8` | 0.5 | 0.086 ms | 0.095 ms |
+| optional miss | 1 | 0.051 ms | 0.057 ms |
+
+At 10k nodes and 50k edges the anchor scan drops to 4.62 ms and the tag-index
+anchor to 0.035 ms; 1/2/3-hop traversal is 0.082/0.289/1.263 ms. Edge endpoint
+indexes make each hop an index lookup. The anchor scan remains linear in label
+size, which is why the tag index matters for selective entry points.
 
 | Dataset (10k vectors) | Index | Build | p50 | Recall@10 |
 | --- | --- | ---: | ---: | ---: |
@@ -193,7 +297,8 @@ verified against a naive token scan.
 
 ## Tag indexes
 
-Tags are exact, case-sensitive values stored as a JSON string or array:
+Tags are exact, case-sensitive scalar strings, scalar numbers, or arrays of
+strings/numbers stored in a JSON property:
 
 ```rust
 g.create_tag_index("Doc", "tags")?;
@@ -216,6 +321,10 @@ Tag matching is exact: `data` does not match `database`, and `Database` does not
 match `database`. Numeric tag values are compared through their decimal string
 form. When no tag index exists, `tag_match` falls back to scanning the property,
 so the feature is usable before DDL and after `DROP TAG INDEX`.
+
+A tag index on an integer or string property also accelerates an inline scalar
+anchor such as `MATCH (n:Person {id: 42})`. The planner uses the tag index to
+fetch the anchor id and then applies the normal exact property filter.
 
 `vector_nn(...) AND tag_match(...)` filters the ANN candidates after retrieval,
 so a selective tag can return fewer than k rows. A future iteration can pass an
@@ -304,13 +413,18 @@ CI enforces this with a grep on `Cargo.toml` and `Cargo.lock`.
   the extension exposes scalars only — see notes in
   `crates/gvec-extension/src/lib.rs`), product/scalar quantization
   (IVF-PQ), exact filtered-vector top-k, case-insensitive tag normalization,
-  full Neo4j Cypher conformance, distributed storage.
+  `DISTINCT`/aggregation, `MATCH ... CREATE`/`MERGE`, relationship-property
+  syntax in patterns, shortest-path operators, full Neo4j Cypher conformance,
+  distributed storage.
 
 ## Tests
 
 ```bash
 cargo test --workspace
 ```
+
+The workspace currently has 91 tests: 61 in the Rust binding, 29 in the core,
+and 1 in the extension.
 
 ## Reference architecture
 

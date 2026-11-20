@@ -19,6 +19,14 @@ The system SHALL provide `CREATE TAG INDEX ON :Label(property)` and
 - **THEN** the tag index stores `database`
 - **AND** `tag_match(n.tags, "database")` matches it
 
+#### Scenario: Scalar numeric tags
+
+- **WHEN** a node contains `id: 42`
+- **AND** `CREATE TAG INDEX ON :Person(id)` exists
+- **THEN** the tag index stores `"42"` and `tag_search("Person", "id", "42")`
+  returns that node
+- **AND** an inline anchor `MATCH (n:Person {id: 42})` may use the index
+
 #### Scenario: Multiple tag indexes coexist
 
 - **WHEN** tag indexes exist on `Doc.tags` and `Doc.category`

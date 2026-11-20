@@ -176,11 +176,19 @@ pub fn create_tag_index(
             "json_each(CASE json_type({column}, '{prop_json}')
                 WHEN 'array' THEN json_extract({column}, '{prop_json}')
                 WHEN 'text' THEN json_quote(json_extract({column}, '{prop_json}'))
+                WHEN 'integer' THEN json_extract({column}, '{prop_json}')
+                WHEN 'real' THEN json_extract({column}, '{prop_json}')
              END)"
         )
     };
     let backfill_values = values_of("n.properties");
     let insert_values = values_of("new.properties");
+    // JSON numeric equality treats 42 and 42.0 as the same value, while
+    // `CAST(42.0 AS TEXT)` is "42.0". Store integral reals in integer form so a
+    // tag-index anchor for integer 42 also finds a property written as 42.0.
+    let tag_value = "CASE WHEN j.type = 'real' AND CAST(j.value AS INTEGER) = j.value \
+                     THEN CAST(CAST(j.value AS INTEGER) AS TEXT) \
+                     ELSE CAST(j.value AS TEXT) END";
 
     // Rebuild in place: drop old triggers and rows, then backfill from the
     // current node state. A repeated CREATE TAG INDEX is idempotent.
@@ -195,10 +203,10 @@ pub fn create_tag_index(
     exec.execute(
         &format!(
             "INSERT OR IGNORE INTO {tags_tbl}(index_id, node_id, tag)
-             SELECT ?1, n.id, CAST(j.value AS TEXT)
+             SELECT ?1, n.id, {tag_value}
              FROM {nodes_tbl} AS n, {backfill_values} AS j
              WHERE n.labels LIKE ?2
-               AND json_type(n.properties, '{prop_json}') IN ('array', 'text')
+               AND json_type(n.properties, '{prop_json}') IN ('array', 'text', 'integer', 'real')
                AND j.type IN ('text', 'integer', 'real')
                AND j.value IS NOT NULL"
         ),
@@ -213,10 +221,10 @@ pub fn create_tag_index(
         &format!(
             "CREATE TRIGGER {ti} AFTER INSERT ON {nodes_tbl} BEGIN
                 INSERT OR IGNORE INTO {tags_tbl}(index_id, node_id, tag)
-                SELECT {idx}, new.id, CAST(j.value AS TEXT)
+                SELECT {idx}, new.id, {tag_value}
                 FROM {insert_values} AS j
                 WHERE new.labels LIKE {label_lit}
-                  AND json_type(new.properties, '{prop_json}') IN ('array', 'text')
+                  AND json_type(new.properties, '{prop_json}') IN ('array', 'text', 'integer', 'real')
                   AND j.type IN ('text', 'integer', 'real')
                   AND j.value IS NOT NULL;
             END",
@@ -229,10 +237,10 @@ pub fn create_tag_index(
             "CREATE TRIGGER {tu} AFTER UPDATE ON {nodes_tbl} BEGIN
                 DELETE FROM {tags_tbl} WHERE index_id = {idx} AND node_id = old.id;
                 INSERT OR IGNORE INTO {tags_tbl}(index_id, node_id, tag)
-                SELECT {idx}, new.id, CAST(j.value AS TEXT)
+                SELECT {idx}, new.id, {tag_value}
                 FROM {insert_values} AS j
                 WHERE new.labels LIKE {label_lit}
-                  AND json_type(new.properties, '{prop_json}') IN ('array', 'text')
+                  AND json_type(new.properties, '{prop_json}') IN ('array', 'text', 'integer', 'real')
                   AND j.type IN ('text', 'integer', 'real')
                   AND j.value IS NOT NULL;
             END",
@@ -340,12 +348,30 @@ pub fn tag_search_ids(
 pub fn value_has_tag(value: &Value, tag: &str) -> bool {
     match value {
         Value::String(s) => s == tag,
+        Value::Number(n) => number_tag(n).is_some_and(|t| t == tag),
         Value::Array(items) => items.iter().any(|item| match item {
             Value::String(s) => s == tag,
-            Value::Number(n) => n.to_string() == tag,
+            Value::Number(n) => number_tag(n).is_some_and(|t| t == tag),
             _ => false,
         }),
         _ => false,
+    }
+}
+
+/// Canonical tag text for a JSON number. Integral reals use integer form so
+/// `42` and `42.0` compare equal, matching JSON numeric equality.
+pub fn number_tag(n: &serde_json::Number) -> Option<String> {
+    if let Some(i) = n.as_i64() {
+        return Some(i.to_string());
+    }
+    if let Some(u) = n.as_u64() {
+        return Some(u.to_string());
+    }
+    let f = n.as_f64()?;
+    if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 {
+        Some((f as i64).to_string())
+    } else {
+        Some(f.to_string())
     }
 }
 
@@ -359,6 +385,8 @@ mod tests {
         assert!(value_has_tag(&json!("database"), "database"));
         assert!(value_has_tag(&json!(["database", "rust"]), "rust"));
         assert!(value_has_tag(&json!([1, 2, 3]), "2"));
+        assert!(value_has_tag(&json!(42), "42"));
+        assert!(value_has_tag(&json!(42.0), "42"));
         assert!(!value_has_tag(&json!(["databases"]), "database"));
         assert!(!value_has_tag(&json!(["Database"]), "database"));
         assert!(!value_has_tag(&json!({"tag": "database"}), "database"));
