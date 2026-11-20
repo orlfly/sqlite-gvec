@@ -8,6 +8,9 @@
 - [x] 1.6 Detect FTS5 availability at runtime (try `CREATE VIRTUAL TABLE ... USING fts5(...)` on a temp table; cache result)
 - [x] 1.7 Add unit tests: create index, insert nodes, search, BM25 ordering, delete sync
 - [x] 1.8 Make `create_text_index` idempotent: switch the backfill `INSERT INTO` to `INSERT OR REPLACE INTO` so re-running for an already-indexed `(label, property)` tuple replaces existing rows instead of failing with a rowid UNIQUE conflict. This makes both the Rust binding and the `CREATE TEXT INDEX` Cypher statement idempotent at the user-visible level.
+- [x] 1.9 Fix sync triggers: the label pattern was quoted twice, so triggers never fired. Use plain `DELETE FROM fts WHERE rowid = old.id` (the special FTS5 `'delete'` command is for external-content tables), and update triggers that handle label addition, removal, and property changes uniformly.
+- [x] 1.10 Rebuild the FTS5 table and triggers in `create_text_index` so a tokenizer change is honored instead of silently reusing the old table.
+- [x] 1.11 Remove the hidden 50-hit cap in `text_match` (`text_search_all`), and return an empty result for empty/whitespace queries instead of an FTS5 syntax error.
 
 ## 2. Query Language Integration (`graph-query-language` modifications)
 
@@ -26,6 +29,8 @@
 - [x] 3.2 Call `fts::text_search()` to get the ranked rowid set; intersect with the node-scan candidates
 - [x] 3.3 Cache BM25 scores per rowid in `ExecState` so `text_score()` can retrieve them during RETURN
 - [x] 3.4 Add planner tests: text_match constrains scan, text_score returns BM25, no-index error
+- [x] 3.5 Pre-filter the node scan by FTS rowids (`list_nodes_by_ids`) so selective text queries do not materialize every labeled node.
+- [x] 3.6 Reject multiple `text_match` predicates or predicates under `OR`/`NOT`/comparison with an explicit error instead of silently changing semantics.
 
 ## 4. Three-Way Fusion (`graph-vector-integration` modifications)
 
@@ -48,3 +53,4 @@
 - [x] 6.1 Update README with FTS quick-start and hybrid-search example
 - [x] 6.2 Verify every spec scenario maps to at least one automated test
 - [x] 6.3 Run `cargo test --workspace` clean; verify clippy/fmt
+- [x] 6.4 Add deterministic FTS benchmark (`fts_bench`): build time, index size, direct vs Cypher latency, incremental write cost, and naive-scan verification.

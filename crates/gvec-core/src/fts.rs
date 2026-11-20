@@ -102,69 +102,90 @@ pub fn create_text_index(
     let fts_tbl = fts_table_name(prefix, label, property);
     let nodes_tbl = format!("{}_nodes", prefix);
     let tok = tokenizer.to_fts5_arg();
-    let lbl_pat_lit = quote_string(&format!("%\"{}\"%", label));
+    let label_pattern = format!("%\"{}\"%", label);
+    let label_lit = quote_string(&label_pattern);
     let prop_json = format!("$.{}", property);
+    let (trig_ins, trig_upd, trig_del) = trigger_names(prefix, label, property);
 
-    // 1. Create FTS5 virtual table (standalone content — stores its own copy).
-    //    `IF NOT EXISTS` makes this idempotent against repeated calls with
-    //    the same (prefix, label, property) tuple.
+    // Rebuild the table and triggers so that a tokenizer change is honored and
+    // trigger definitions are always current. The index is derived data, so
+    // dropping and backfilling it is safe.
+    for t in [&trig_ins, &trig_upd, &trig_del] {
+        exec.execute(&format!("DROP TRIGGER IF EXISTS {}", quote_ident(t)), &[])?;
+    }
+    exec.execute(
+        &format!("DROP TABLE IF EXISTS {}", quote_ident(&fts_tbl)),
+        &[],
+    )?;
+
+    // 1. Create FTS5 virtual table (standalone content: stores its own copy).
     exec.execute(
         &format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS {} USING fts5(content, tokenize={})",
+            "CREATE VIRTUAL TABLE {} USING fts5(content, tokenize={})",
             fts_tbl,
             quote_string(tok)
         ),
         &[],
     )?;
 
-    // 2. Backfill existing matching nodes. We use `INSERT OR REPLACE` so the
-    //    second call of `create_text_index` for an already-indexed
-    //    (label, property) does not fail with a rowid UNIQUE conflict: each
-    //    existing FTS5 row is replaced with the current property value, and
-    //    new labels/properties get a fresh row. This makes both
-    //    `create_text_index` and `CREATE TEXT INDEX` idempotent at the
-    //    user-visible level.
+    // 2. Backfill existing matching nodes. The table was just recreated, so
+    //    this populates a clean index and makes repeated CREATE TEXT INDEX
+    //    calls idempotent at the user-visible level.
     exec.execute(
         &format!(
-            "INSERT OR REPLACE INTO {}(rowid, content) SELECT id, json_extract(properties, '{}') FROM {} WHERE labels LIKE ?1 AND json_extract(properties, '{}') IS NOT NULL",
+            "INSERT INTO {}(rowid, content) SELECT id, json_extract(properties, '{}') FROM {} WHERE labels LIKE ?1 AND json_extract(properties, '{}') IS NOT NULL",
             fts_tbl, prop_json, nodes_tbl, prop_json
         ),
         &[SqlValue::Text(format!("%\"{}\"%", label))],
     )?;
 
-    // 3. Sync triggers using WHEN clauses to filter by label.
-    // NOTE: FTS5 'delete' uses the special {tbl} placeholder for the table name;
-    // we emit literal braces by escaping them in the format string as `{{...}}`.
-    let (trig_ins, trig_upd, trig_del) = trigger_names(prefix, label, property);
-    let q_ins = quote_string(&lbl_pat_lit); // single-quoted SQL literal
-
+    // 3. Sync triggers. Nodes are stored with a JSON `labels` array, so the
+    //    label test is a LIKE over the serialized array. The update trigger
+    //    always deletes the old row and conditionally inserts the new one, so
+    //    it handles label addition, removal, and property changes uniformly.
     exec.execute(
         &format!(
-            "CREATE TRIGGER IF NOT EXISTS {ti} AFTER INSERT ON {nt} WHEN new.labels LIKE {lp} BEGIN
-                INSERT INTO {ft}(rowid, content) VALUES (new.id, json_extract(new.properties, '{pj}'));
+            "CREATE TRIGGER {ti} AFTER INSERT ON {nt} BEGIN
+                INSERT INTO {ft}(rowid, content)
+                SELECT new.id, json_extract(new.properties, '{pj}')
+                WHERE new.labels LIKE {lp}
+                  AND json_extract(new.properties, '{pj}') IS NOT NULL;
             END",
-            ti = trig_ins, nt = nodes_tbl, lp = q_ins, ft = fts_tbl, pj = prop_json,
+            ti = trig_ins,
+            nt = nodes_tbl,
+            lp = label_lit,
+            ft = fts_tbl,
+            pj = prop_json,
         ),
         &[],
     )?;
 
     exec.execute(
         &format!(
-            "CREATE TRIGGER IF NOT EXISTS {td} AFTER DELETE ON {nt} WHEN old.labels LIKE {lp} BEGIN
-                INSERT INTO {ft}({ft}, rowid, content) VALUES('delete', old.id, json_extract(old.properties, '{pj}'));
+            "CREATE TRIGGER {td} AFTER DELETE ON {nt} BEGIN
+                DELETE FROM {ft} WHERE rowid = old.id;
             END",
-            td = trig_del, nt = nodes_tbl, lp = q_ins, ft = fts_tbl, pj = prop_json,
+            td = trig_del,
+            nt = nodes_tbl,
+            ft = fts_tbl,
         ),
         &[],
     )?;
 
     exec.execute(
         &format!(
-            "CREATE TRIGGER IF NOT EXISTS {tu} AFTER UPDATE ON {nt} WHEN new.labels LIKE {lp} BEGIN
-                INSERT INTO {ft}({ft}, rowid, content) VALUES('delete', old.id, json_extract(old.properties, '{pj}'));
-                INSERT INTO {ft}(rowid, content) VALUES (new.id, json_extract(new.properties, '{pj}'));
+            "CREATE TRIGGER {tu} AFTER UPDATE ON {nt} BEGIN
+                DELETE FROM {ft} WHERE rowid = old.id;
+                INSERT INTO {ft}(rowid, content)
+                SELECT new.id, json_extract(new.properties, '{pj}')
+                WHERE new.labels LIKE {lp}
+                  AND json_extract(new.properties, '{pj}') IS NOT NULL;
             END",
-            tu = trig_upd, nt = nodes_tbl, lp = q_ins, ft = fts_tbl, pj = prop_json,
+            tu = trig_upd,
+            nt = nodes_tbl,
+            lp = label_lit,
+            ft = fts_tbl,
+            pj = prop_json,
         ),
         &[],
     )?;
@@ -205,22 +226,56 @@ pub fn text_search(
     query: &str,
     k: usize,
 ) -> Result<Vec<(i64, f32)>> {
+    text_search_inner(exec, prefix, label, property, query, Some(k))
+}
+
+/// Search the FTS5 index without a result limit.
+pub fn text_search_all(
+    exec: &dyn SqlExecutor,
+    prefix: &str,
+    label: &str,
+    property: &str,
+    query: &str,
+) -> Result<Vec<(i64, f32)>> {
+    text_search_inner(exec, prefix, label, property, query, None)
+}
+
+fn text_search_inner(
+    exec: &dyn SqlExecutor,
+    prefix: &str,
+    label: &str,
+    property: &str,
+    query: &str,
+    limit: Option<usize>,
+) -> Result<Vec<(i64, f32)>> {
     validate_identifier("prefix", prefix)?;
     validate_identifier("label", label)?;
     validate_identifier("property", property)?;
+    if query.trim().is_empty() || limit == Some(0) {
+        return Ok(Vec::new());
+    }
     let fts_tbl = fts_table_name(prefix, label, property);
     let q_tbl = quote_ident(&fts_tbl);
-    let sql = format!(
-        "SELECT rowid, -bm25({}) AS score FROM {} WHERE {} MATCH ?1 ORDER BY score DESC LIMIT ?2",
-        q_tbl, q_tbl, q_tbl
-    );
-    let rows = exec.query_all_json(
-        &sql,
-        &[
-            SqlValue::Text(query.to_string()),
-            SqlValue::Integer(k as i64),
-        ],
-    )?;
+    let (sql, params) = match limit {
+        Some(k) => (
+            format!(
+                "SELECT rowid, -bm25({}) AS score FROM {} WHERE {} MATCH ?1 ORDER BY score DESC LIMIT ?2",
+                q_tbl, q_tbl, q_tbl
+            ),
+            vec![
+                SqlValue::Text(query.to_string()),
+                SqlValue::Integer(k as i64),
+            ],
+        ),
+        None => (
+            format!(
+                "SELECT rowid, -bm25({}) AS score FROM {} WHERE {} MATCH ?1 ORDER BY score DESC",
+                q_tbl, q_tbl, q_tbl
+            ),
+            vec![SqlValue::Text(query.to_string())],
+        ),
+    };
+    let rows = exec.query_all_json(&sql, &params)?;
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         if row.len() < 2 {

@@ -272,6 +272,42 @@ impl Storage {
         Ok(out)
     }
 
+    /// Fetch nodes by id, in chunks that stay below SQLite's variable limit.
+    pub fn list_nodes_by_ids(&self, ids: &std::collections::HashSet<i64>) -> Result<Vec<Node>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = ids.iter().copied().collect();
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<SqlValue> = chunk.iter().map(|id| SqlValue::from(*id)).collect();
+            let rows = self.exec.query_all_json(
+                &format!(
+                    "SELECT id, labels, properties FROM {} WHERE id IN ({})",
+                    self.tbl("nodes"),
+                    placeholders
+                ),
+                &params,
+            )?;
+            for row in rows {
+                let id = json_to_i64(&row[0])?;
+                let labels = json_to_string(&row[1])?;
+                let properties = json_to_string(&row[2])?;
+                out.push(Node {
+                    id: NodeId(id),
+                    labels: serde_json::from_str(&labels)?,
+                    properties: serde_json::from_str(&properties)?,
+                });
+            }
+        }
+        out.sort_by_key(|n| n.id.0);
+        Ok(out)
+    }
+
     pub fn set_node_labels(&self, id: NodeId, labels: &[String]) -> Result<()> {
         let node = self.get_node(id)?;
         self.update_node(id, labels, &node.properties)

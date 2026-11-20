@@ -1012,4 +1012,259 @@ mod tests {
             .unwrap();
         assert!(rs.rows.is_empty(), "expected no rows, got {:?}", rs.rows);
     }
+
+    #[test]
+    fn fts_update_and_delete_sync() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "a", body: "rust database"})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "b", body: "python runtime"})"#)
+            .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+
+        // Updating a node must remove the old terms and index the new ones.
+        g.run(r#"MATCH (n:Doc) WHERE n.title = "a" SET n.body = "python tooling""#)
+            .unwrap();
+        assert!(g.text_search("Doc", "body", "rust", 10).unwrap().is_empty());
+        assert_eq!(
+            g.text_search("Doc", "body", "tooling", 10).unwrap().len(),
+            1
+        );
+
+        // Deleting a node must remove it from the index.
+        g.run(r#"MATCH (n:Doc) WHERE n.title = "b" DELETE n"#)
+            .unwrap();
+        assert!(
+            g.text_search("Doc", "body", "runtime", 10)
+                .unwrap()
+                .is_empty(),
+            "deleted node must not remain searchable"
+        );
+    }
+
+    #[test]
+    fn fts_insert_after_index_sync() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust database"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+
+        // The AFTER INSERT trigger must index nodes created after the index.
+        g.run(r#"CREATE (b:Doc {body: "python runtime"})"#).unwrap();
+        assert_eq!(g.text_search("Doc", "body", "python", 10).unwrap().len(), 1);
+
+        // Nodes without the indexed property are skipped, not indexed as NULL.
+        g.run(r#"CREATE (c:Doc {title: "no body"})"#).unwrap();
+        assert_eq!(g.text_search("Doc", "body", "python", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fts_label_changes_sync() {
+        use gvec_core::ids::NodeId;
+
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        let id = g
+            .storage
+            .create_node(&["Doc".into()], &json!({"body": "rust database"}))
+            .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        assert_eq!(g.text_search("Doc", "body", "rust", 10).unwrap().len(), 1);
+
+        // Removing the indexed label must remove the row from FTS.
+        g.storage
+            .set_node_labels(NodeId(id.0), &["Other".into()])
+            .unwrap();
+        assert!(
+            g.text_search("Doc", "body", "rust", 10).unwrap().is_empty(),
+            "row with a removed label must not remain searchable"
+        );
+
+        // Adding the label back must index the row again.
+        g.storage
+            .set_node_labels(NodeId(id.0), &["Doc".into()])
+            .unwrap();
+        assert_eq!(
+            g.text_search("Doc", "body", "rust", 10).unwrap().len(),
+            1,
+            "row must be searchable after the label returns"
+        );
+    }
+
+    #[test]
+    fn fts_tokenizer_reconfiguration_is_honored() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "running quickly"})"#)
+            .unwrap();
+        g.create_text_index("Doc", "body", Some("unicode61"))
+            .unwrap();
+        assert!(
+            g.text_search("Doc", "body", "run", 10).unwrap().is_empty(),
+            "unicode61 must not stem 'running' to 'run'"
+        );
+
+        // Re-creating with porter must switch the tokenizer, not silently keep
+        // the previous one.
+        g.create_text_index("Doc", "body", Some("porter")).unwrap();
+        assert_eq!(
+            g.text_search("Doc", "body", "run", 10).unwrap().len(),
+            1,
+            "porter should stem 'running' to 'run'"
+        );
+    }
+
+    #[test]
+    fn fts_bm25_repeated_term_ranks_higher() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust rust rust database engine"})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {body: "rust database engine tools"})"#)
+            .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        let res = g.text_search("Doc", "body", "rust", 10).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(
+            res[0].0, 1,
+            "the document with more occurrences should rank first"
+        );
+        assert!(res[0].1 > res[1].1, "scores must be descending");
+    }
+
+    #[test]
+    fn fts_text_match_is_not_capped_at_50() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        for i in 0..75 {
+            g.storage
+                .create_node(
+                    &["Doc".into()],
+                    &json!({"body": format!("common term {i}")}),
+                )
+                .unwrap();
+        }
+        g.create_text_index("Doc", "body", None).unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE text_match(n.body, "common")
+                   RETURN n.body AS body"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 75, "text_match must not silently cap hits");
+
+        // The query's own LIMIT still applies.
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE text_match(n.body, "common")
+                   RETURN n.body AS body LIMIT 10"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 10);
+    }
+
+    #[test]
+    fn fts_empty_query_returns_no_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust database"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        assert!(g.text_search("Doc", "body", "", 10).unwrap().is_empty());
+        assert!(g.text_search("Doc", "body", "   ", 10).unwrap().is_empty());
+        let rs = g
+            .run(r#"MATCH (n:Doc) WHERE text_match(n.body, "") RETURN n.body AS body"#)
+            .unwrap();
+        assert!(rs.rows.is_empty());
+    }
+
+    #[test]
+    fn fts_boolean_prefix_and_phrase_syntax() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust database engine"})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {body: "rust async runtime"})"#)
+            .unwrap();
+        g.run(r#"CREATE (c:Doc {body: "python database engine"})"#)
+            .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+
+        // AND, OR, NOT, prefix, and phrase are passed through to FTS5.
+        assert_eq!(
+            g.text_search("Doc", "body", "rust AND database", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            g.text_search("Doc", "body", "rust OR python", 10)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            g.text_search("Doc", "body", "database NOT python", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(g.text_search("Doc", "body", "data*", 10).unwrap().len(), 2);
+        assert_eq!(
+            g.text_search("Doc", "body", "\"rust database\"", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fts_multiple_text_match_is_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "guide", body: "rust database"})"#)
+            .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        g.create_text_index("Doc", "title", None).unwrap();
+        let err = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE text_match(n.body, "rust") AND text_match(n.title, "guide")
+                   RETURN n.title AS title"#,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("multiple text_match"),
+            "expected an explicit limitation, got: {err}"
+        );
+
+        let err = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE text_match(n.body, "rust") OR n.title = "guide"
+                   RETURN n.title AS title"#,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("top-level conjunct"),
+            "expected an explicit limitation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn fts_trigram_substring_and_cjk() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "embedded vector database"})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {body: "图数据库支持全文检索"})"#)
+            .unwrap();
+        g.create_text_index("Doc", "body", Some("trigram")).unwrap();
+
+        let res = g.text_search("Doc", "body", "vector data", 10).unwrap();
+        assert_eq!(res.len(), 1, "trigram must match interior substrings");
+
+        let cjk = g.text_search("Doc", "body", "全文检索", 10).unwrap();
+        assert_eq!(cjk.len(), 1, "trigram must match CJK substrings");
+    }
 }

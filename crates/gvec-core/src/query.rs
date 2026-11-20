@@ -1519,14 +1519,22 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
             };
 
             let mut current = state.rows.clone();
+            let vector_constraint = CandidateConstraint {
+                variable: vector_variable.as_deref(),
+                ids: vector_candidates.as_ref(),
+            };
+            let text_constraint = CandidateConstraint {
+                variable: text_variable.as_deref(),
+                ids: Some(&fts_rowids),
+            };
             for pattern in &m.patterns {
                 current = execute_match(
                     storage,
                     pattern,
                     &current,
                     m.optional,
-                    vector_variable.as_deref(),
-                    vector_candidates.as_ref(),
+                    vector_constraint,
+                    text_constraint,
                 )?;
             }
 
@@ -1724,6 +1732,19 @@ fn extract_text_match(
     where_: &Expr,
     patterns: &[Pattern],
 ) -> Result<Option<TextMatchPredicate>> {
+    let (count, unsupported_position) = text_match_shape(where_, true);
+    if count > 1 {
+        return Err(Error::Query(
+            "multiple text_match predicates are not supported; combine terms in one FTS5 query"
+                .into(),
+        ));
+    }
+    if unsupported_position {
+        return Err(Error::Query(
+            "text_match must be a top-level conjunct; use a single FTS5 query for OR/NOT terms"
+                .into(),
+        ));
+    }
     // Find the TextMatch expression by walking the WHERE tree
     let tm = find_text_match(where_);
     let tm = match tm {
@@ -1743,17 +1764,38 @@ fn extract_text_match(
         ));
     }
     // Run FTS search
-    let results = crate::fts::text_search(
-        storage.exec.as_ref(),
-        &storage.prefix,
-        &label,
-        &tm.1,
-        &tm.2,
-        50,
-    )?;
+    // `text_match` has no user-facing k; fetch every hit and let the query's
+    // own SKIP/LIMIT (applied after graph matching) decide the result size.
+    let results =
+        crate::fts::text_search_all(storage.exec.as_ref(), &storage.prefix, &label, &tm.1, &tm.2)?;
     let rowids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
     let scores: std::collections::HashMap<i64, f32> = results.into_iter().collect();
     Ok(Some((tm.0, rowids, scores)))
+}
+
+/// Count `text_match` expressions and report whether any appears under OR,
+/// NOT, or a comparison, where rowid-set pre-filtering would change semantics.
+fn text_match_shape(e: &Expr, conjunctive: bool) -> (usize, bool) {
+    match e {
+        Expr::TextMatch { .. } => (1, !conjunctive),
+        Expr::And(a, b) => {
+            let (ca, ba) = text_match_shape(a, conjunctive);
+            let (cb, bb) = text_match_shape(b, conjunctive);
+            (ca + cb, ba || bb)
+        }
+        Expr::Or(a, b) => {
+            let (ca, ba) = text_match_shape(a, false);
+            let (cb, bb) = text_match_shape(b, false);
+            (ca + cb, ba || bb)
+        }
+        Expr::Not(a) => text_match_shape(a, false),
+        Expr::Cmp(a, _, b) => {
+            let (ca, ba) = text_match_shape(a, false);
+            let (cb, bb) = text_match_shape(b, false);
+            (ca + cb, ba || bb)
+        }
+        _ => (0, false),
+    }
 }
 
 /// Recursively search for a TextMatch expression in the WHERE tree.
@@ -1887,16 +1929,50 @@ fn execute_create(storage: &Storage, p: &Pattern, rows: Vec<Row>) -> Result<Vec<
     Ok(out)
 }
 
+/// A rowid constraint from an ANN or FTS predicate. When it targets the first
+/// node of a pattern, filtering during the scan avoids materializing every
+/// labeled node before the row-level intersection.
+#[derive(Clone, Copy)]
+struct CandidateConstraint<'a> {
+    variable: Option<&'a str>,
+    ids: Option<&'a HashSet<i64>>,
+}
+
+impl CandidateConstraint<'_> {
+    fn ids_for(&self, variable: &str) -> Option<&HashSet<i64>> {
+        if self.variable == Some(variable) {
+            self.ids
+        } else {
+            None
+        }
+    }
+
+    fn apply(&self, variable: &str, nodes: &mut Vec<Node>) {
+        if let Some(ids) = self.ids_for(variable) {
+            nodes.retain(|n| ids.contains(&n.id.0));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_match(
     storage: &Storage,
     p: &Pattern,
     base_rows: &[Row],
     optional: bool,
-    candidate_variable: Option<&str>,
-    candidate_ids: Option<&HashSet<i64>>,
+    vector_constraint: CandidateConstraint<'_>,
+    text_constraint: CandidateConstraint<'_>,
 ) -> Result<Vec<Row>> {
     let first_node = &p.segments[0].node;
-    let mut nodes: Vec<Node> = if first_node.labels.is_empty() {
+    // When an FTS predicate targets this variable, fetch only its matching
+    // rowids instead of materializing every labeled node and filtering after.
+    let mut nodes: Vec<Node> = if let Some(ids) = text_constraint.ids_for(&first_node.variable) {
+        let mut nodes = storage.list_nodes_by_ids(ids)?;
+        if !first_node.labels.is_empty() {
+            nodes.retain(|n| first_node.labels.iter().any(|l| n.labels.contains(l)));
+        }
+        nodes
+    } else if first_node.labels.is_empty() {
         storage.list_nodes_by_label("")?
     } else {
         let mut all: Vec<Node> = Vec::new();
@@ -1909,14 +1985,10 @@ fn execute_match(
         all.dedup_by_key(|n| n.id.0);
         all
     };
-    // The vector_nn candidate set constrains the scan when it targets this
-    // pattern's first node. Other patterns still evaluate normally (the
-    // executor intersects candidate sets at the row level afterwards).
-    if candidate_variable == Some(first_node.variable.as_str()) {
-        if let Some(ids) = candidate_ids {
-            nodes.retain(|n| ids.contains(&n.id.0));
-        }
-    }
+    // The ANN candidate set constrains the scan when it targets this pattern's
+    // first node. Other patterns still evaluate normally (the executor
+    // intersects candidate sets at the row level afterwards).
+    vector_constraint.apply(&first_node.variable, &mut nodes);
     // Apply inline property filters from the node pattern, e.g.
     // `MATCH (n:Person {name: "Alice"})`. Properties are matched against the
     // node's stored property map.

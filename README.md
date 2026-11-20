@@ -130,6 +130,60 @@ for latency at query time without rebuilding (`HnswIndex::search_with_ef`).
 Binary Hamming space has many distance ties and is the weakest case for the
 current graph heuristic.
 
+## Full-text search
+
+gvec indexes text properties with SQLite FTS5 and ranks hits with BM25:
+
+```rust
+g.create_text_index("Doc", "body", None)?; // unicode61
+let rs = g.run(r#"
+    MATCH (n:Doc)
+    WHERE text_match(n.body, "rust AND database")
+    RETURN n.title, text_score(n) AS score
+    ORDER BY score DESC LIMIT 10
+"#)?;
+```
+
+Tokenizers are `unicode61` (default), `porter`, and `trigram`. Use `trigram`
+for substring and CJK matching; `unicode61` treats a run of Han characters as
+one token. Queries use FTS5 syntax: `AND`, `OR`, `NOT`, quoted phrases, and
+`prefix*`.
+
+`CREATE TEXT INDEX` rebuilds the index and its sync triggers. Inserts,
+property updates, label changes, and deletes stay in sync. `text_match`
+supports one predicate per `MATCH`, as a top-level `AND` condition; combine
+terms in one FTS5 query instead of writing multiple `text_match` calls.
+
+### FTS benchmark
+
+```bash
+cargo run --release -p gvec --example fts_bench
+```
+
+Deterministic Zipf corpus, 80 tokens/doc, 50k docs, in-memory SQLite,
+single-threaded. `direct` is `Graph::text_search(..., k=10)`, `cypher` is
+`MATCH ... WHERE text_match(...) RETURN ... LIMIT 10`.
+
+| Query | Matches | Direct p50 | Cypher p50 |
+| --- | ---: | ---: | ---: |
+| common term | 49,983 | 29.6 ms | 341.7 ms |
+| medium term | 3,669 | 2.19 ms | 20.9 ms |
+| rare term | 31 | 0.067 ms | 0.223 ms |
+| two-term AND | 1,871 | 1.43 ms | 4.80 ms |
+| boolean OR | 36,306 | 8.15 ms | 85.6 ms |
+| phrase | 3,847 | 3.35 ms | 27.7 ms |
+| prefix | 293 | 0.375 ms | 1.98 ms |
+| no hit | 0 | 0.028 ms | 0.030 ms |
+
+Index build scales linearly: 19 ms for 1k docs, 0.24 s for 10k, and 1.43 s for
+50k (28.6 us/doc), using 40.3 MB at 50k (844 bytes/doc). Incremental inserts
+with sync triggers cost 0.27 to 0.52 ms/doc. Selective queries are
+sub-millisecond. Broad terms scale with hit count: the Cypher path materializes
+every text hit before `LIMIT`, while `text_search` returns only k rows. Use
+`text_search` for broad-query top-k and `text_match` when the text filter is
+combined with graph or vector predicates. All eight benchmark result sets were
+verified against a naive token scan.
+
 ## Quick start (SQLite extension)
 
 ```bash
