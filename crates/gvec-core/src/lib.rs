@@ -1,7 +1,7 @@
 //! `gvec-core`: pure-Rust core for the gvec graph + vector engine.
 //!
-//! Holds storage (node/edge/property), vector encoding, the Cypher-like
-//! query pipeline, and graph/vector fusion. No SQLite FFI lives here —
+//! Holds storage (node/edge/property), vector encoding, tag indexes, the
+//! Cypher-like query pipeline, and graph/vector fusion. No SQLite FFI lives here —
 //! SQLite integration is the job of `gvec-extension` (via `sqlite-loadable`)
 //! and `gvec-bindings` (via `rusqlite`). The `SqlExecutor` trait here is the
 //! boundary those crates implement.
@@ -16,6 +16,7 @@ pub mod property;
 pub mod query;
 pub mod sql;
 pub mod storage;
+pub mod tag;
 pub mod vector;
 pub mod vector_index;
 
@@ -27,6 +28,7 @@ pub mod prelude {
     pub use crate::node::{Node, NodeRecord};
     pub use crate::sql::{SqlExecutor, SqlValue};
     pub use crate::storage::{Storage, StorageSnapshot, VectorIndexMeta};
+    pub use crate::tag::TagIndexMeta;
     pub use crate::vector::{Distance, ElementType, VectorBlob, VectorValue};
     pub use crate::vector_index::{
         FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
@@ -41,6 +43,7 @@ pub use ids::{EdgeId, NodeId};
 pub use node::{Node, NodeRecord};
 pub use sql::{SqlExecutor, SqlValue};
 pub use storage::{Storage, StorageSnapshot, VectorIndexMeta};
+pub use tag::TagIndexMeta;
 pub use vector::{Distance, ElementType, VectorBlob, VectorValue};
 pub use vector_index::{
     FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,

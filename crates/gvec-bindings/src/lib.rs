@@ -7,6 +7,7 @@ pub use gvec_core::error::{Error, Result};
 use gvec_core::sql::{SqlExecutor, SqlValue};
 use gvec_core::storage::Storage;
 pub use gvec_core::storage::VectorIndexMeta;
+pub use gvec_core::tag::TagIndexMeta;
 pub use gvec_core::vector::{Distance, ElementType, VectorBlob, VectorValue};
 pub use gvec_core::vector_index::{
     FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
@@ -294,6 +295,31 @@ impl Graph {
             query,
             k,
         )
+    }
+
+    /// Create or rebuild an exact tag index over `label.property`.
+    pub fn create_tag_index(&self, label: &str, property: &str) -> Result<TagIndexMeta> {
+        self.storage.create_tag_index(label, property)
+    }
+
+    /// Drop a tag index and its stored tags.
+    pub fn drop_tag_index(&self, label: &str, property: &str) -> Result<()> {
+        self.storage.drop_tag_index(label, property)
+    }
+
+    /// List every tag index in this graph.
+    pub fn list_tag_indexes(&self) -> Result<Vec<TagIndexMeta>> {
+        self.storage.tag_indexes()
+    }
+
+    /// Number of distinct nodes in a tag index.
+    pub fn tag_count(&self, label: &str, property: &str) -> Result<usize> {
+        self.storage.tag_count(label, property)
+    }
+
+    /// Fetch up to `k` node ids carrying an exact tag.
+    pub fn tag_search(&self, label: &str, property: &str, tag: &str, k: usize) -> Result<Vec<i64>> {
+        self.storage.tag_search_limit(label, property, tag, Some(k))
     }
 }
 
@@ -1266,5 +1292,270 @@ mod tests {
 
         let cjk = g.text_search("Doc", "body", "全文检索", 10).unwrap();
         assert_eq!(cjk.len(), 1, "trigram must match CJK substrings");
+    }
+
+    #[test]
+    fn tag_index_create_and_search() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "a", tags: ["database", "rust"]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "b", tags: ["python", "web"]})"#)
+            .unwrap();
+        g.run(r#"CREATE (c:Doc {title: "c", tags: "database"})"#)
+            .unwrap();
+
+        let meta = g.create_tag_index("Doc", "tags").unwrap();
+        assert_eq!(meta.label, "Doc");
+        assert_eq!(meta.property, "tags");
+        assert_eq!(g.list_tag_indexes().unwrap().len(), 1);
+        assert_eq!(g.tag_count("Doc", "tags").unwrap(), 3);
+
+        let ids = g.tag_search("Doc", "tags", "database", 10).unwrap();
+        assert_eq!(ids, vec![1, 3], "strings and array elements must match");
+        assert!(g.tag_search("Doc", "tags", "data", 10).unwrap().is_empty());
+        assert!(g
+            .tag_search("Doc", "tags", "Database", 10)
+            .unwrap()
+            .is_empty());
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE tag_match(n.tags, "database")
+                   RETURN n.title AS title ORDER BY title ASC"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")], vec![json!("c")]]);
+
+        // Multiple tag_match predicates on the same variable intersect.
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE tag_match(n.tags, "database") AND tag_match(n.tags, "rust")
+                   RETURN n.title AS title"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")]]);
+    }
+
+    #[test]
+    fn tag_index_syncs_insert_update_delete_and_labels() {
+        use gvec_core::ids::NodeId;
+
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "a", tags: ["rust"]})"#)
+            .unwrap();
+        g.create_tag_index("Doc", "tags").unwrap();
+
+        g.run(r#"CREATE (b:Doc {title: "b", tags: ["database"]})"#)
+            .unwrap();
+        assert_eq!(
+            g.tag_search("Doc", "tags", "database", 10).unwrap(),
+            vec![2]
+        );
+
+        g.run(r#"MATCH (n:Doc) WHERE n.title = "a" SET n.tags = ["python"]"#)
+            .unwrap();
+        assert!(g.tag_search("Doc", "tags", "rust", 10).unwrap().is_empty());
+        assert_eq!(g.tag_search("Doc", "tags", "python", 10).unwrap(), vec![1]);
+
+        g.storage
+            .set_node_labels(NodeId(1), &["Other".into()])
+            .unwrap();
+        assert!(g
+            .tag_search("Doc", "tags", "python", 10)
+            .unwrap()
+            .is_empty());
+        g.storage
+            .set_node_labels(NodeId(1), &["Doc".into()])
+            .unwrap();
+        assert_eq!(g.tag_search("Doc", "tags", "python", 10).unwrap(), vec![1]);
+
+        g.run(r#"MATCH (n:Doc) WHERE n.title = "b" DELETE n"#)
+            .unwrap();
+        assert!(g
+            .tag_search("Doc", "tags", "database", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn tag_index_combines_with_text_and_vector() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(
+            r#"CREATE (a:Doc {
+                title: "a",
+                body: "rust database engine",
+                tags: ["database", "rust"],
+                embedding: [0.0, 0.0]
+            })"#,
+        )
+        .unwrap();
+        g.run(
+            r#"CREATE (b:Doc {
+                title: "b",
+                body: "rust async runtime",
+                tags: ["runtime", "rust"],
+                embedding: [1.0, 0.0]
+            })"#,
+        )
+        .unwrap();
+        g.run(
+            r#"CREATE (c:Doc {
+                title: "c",
+                body: "python database",
+                tags: ["database", "python"],
+                embedding: [5.0, 5.0]
+            })"#,
+        )
+        .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        g.create_vector_index("Doc", "embedding", "flat", None, None)
+            .unwrap();
+        g.create_tag_index("Doc", "tags").unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE text_match(n.body, "rust") AND tag_match(n.tags, "database")
+                   RETURN n.title AS title"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")]]);
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE vector_nn(n.embedding, [0.0, 0.0], 3)
+                     AND tag_match(n.tags, "database")
+                   RETURN n.title AS title"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")], vec![json!("c")]]);
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE text_match(n.body, "rust")
+                     AND vector_nn(n.embedding, [0.0, 0.0], 3)
+                     AND tag_match(n.tags, "database")
+                   RETURN n.title AS title"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")]]);
+    }
+
+    #[test]
+    fn tag_index_drop_and_fallback() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {tags: ["database", "rust"]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {tags: ["python"]})"#).unwrap();
+
+        // tag_match works before an index exists by scanning the property.
+        let rs = g
+            .run(r#"MATCH (n:Doc) WHERE tag_match(n.tags, "database") RETURN n.tags AS tags"#)
+            .unwrap();
+        assert_eq!(rs.rows.len(), 1);
+
+        let meta = g.create_tag_index("Doc", "tags").unwrap();
+        assert_eq!(g.tag_count("Doc", "tags").unwrap(), 2);
+        let meta2 = g.create_tag_index("Doc", "tags").unwrap();
+        assert_eq!(meta.id, meta2.id, "re-create must reuse the metadata row");
+        assert_eq!(g.list_tag_indexes().unwrap().len(), 1);
+        assert_eq!(g.tag_count("Doc", "tags").unwrap(), 2);
+
+        g.run("DROP TAG INDEX ON :Doc(tags)").unwrap();
+        assert!(g.list_tag_indexes().unwrap().is_empty());
+        // The exact fallback still answers queries after the index is dropped.
+        let rs = g
+            .run(r#"MATCH (n:Doc) WHERE tag_match(n.tags, "rust") RETURN n.tags AS tags"#)
+            .unwrap();
+        assert_eq!(rs.rows.len(), 1);
+    }
+
+    #[test]
+    fn tag_index_persists_across_reopen() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tags.db");
+        let path = path.to_str().unwrap().to_string();
+
+        {
+            let db = Database::open(&path).unwrap();
+            let g = db.graph("persist").unwrap();
+            g.run(r#"CREATE (a:Doc {title: "a", tags: ["database", "rust"]})"#)
+                .unwrap();
+            g.create_tag_index("Doc", "tags").unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let g = db.graph("persist").unwrap();
+        assert_eq!(g.list_tag_indexes().unwrap().len(), 1);
+        assert_eq!(g.tag_count("Doc", "tags").unwrap(), 1);
+        let rs = g
+            .run(r#"MATCH (n:Doc) WHERE tag_match(n.tags, "rust") RETURN n.title AS title"#)
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![json!("a")]]);
+    }
+
+    #[test]
+    fn tag_indexes_are_independent() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {tags: ["rust"], category: ["database"]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {tags: ["python"], category: ["database"]})"#)
+            .unwrap();
+
+        g.create_tag_index("Doc", "tags").unwrap();
+        g.create_tag_index("Doc", "category").unwrap();
+        assert_eq!(g.list_tag_indexes().unwrap().len(), 2);
+        assert_eq!(g.tag_count("Doc", "tags").unwrap(), 2);
+        assert_eq!(g.tag_count("Doc", "category").unwrap(), 2);
+        assert_eq!(g.tag_search("Doc", "tags", "rust", 10).unwrap(), vec![1]);
+        assert_eq!(
+            g.tag_search("Doc", "category", "database", 10).unwrap(),
+            vec![1, 2]
+        );
+
+        g.drop_tag_index("Doc", "tags").unwrap();
+        assert_eq!(g.list_tag_indexes().unwrap().len(), 1);
+        // The dropped property still answers through the exact fallback scan.
+        assert_eq!(g.tag_search("Doc", "tags", "rust", 10).unwrap(), vec![1]);
+        assert_eq!(
+            g.tag_search("Doc", "category", "database", 10).unwrap(),
+            vec![1, 2],
+            "dropping one index must not affect another"
+        );
+    }
+
+    #[test]
+    fn tag_match_rejects_or_and_mixed_variables() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {tags: ["rust"]})-[:MENTIONS]->(b:Tag {tags: ["rust"]})"#)
+            .unwrap();
+
+        let err = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE tag_match(n.tags, "rust") OR n.tags = "python"
+                   RETURN n.tags AS tags"#,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("top-level conjunct"));
+
+        let err = g
+            .run(
+                r#"MATCH (n:Doc)-[:MENTIONS]->(m:Tag)
+                   WHERE tag_match(n.tags, "rust") AND tag_match(m.tags, "rust")
+                   RETURN n.tags AS tags"#,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("same variable"));
     }
 }

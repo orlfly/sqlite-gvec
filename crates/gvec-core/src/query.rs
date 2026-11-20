@@ -25,6 +25,8 @@ pub enum Statement {
     Delete(Delete),
     CreateTextIndex(CreateTextIndex),
     DropTextIndex(DropTextIndex),
+    CreateTagIndex(CreateTagIndex),
+    DropTagIndex(DropTagIndex),
     CreateVectorIndex(CreateVectorIndex),
     DropVectorIndex(DropVectorIndex),
 }
@@ -74,6 +76,18 @@ pub struct CreateTextIndex {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DropTextIndex {
+    pub label: String,
+    pub property: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateTagIndex {
+    pub label: String,
+    pub property: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DropTagIndex {
     pub label: String,
     pub property: String,
 }
@@ -159,6 +173,11 @@ pub enum Expr {
         variable: String,
         property: String,
         query: String,
+    },
+    TagMatch {
+        variable: String,
+        property: String,
+        tag: String,
     },
     TextScore {
         variable: String,
@@ -280,7 +299,7 @@ impl<'a> Lexer<'a> {
             "AND" | "OR" | "NOT" | "IN" | "CREATE" | "MATCH" | "OPTIONAL" | "RETURN" | "SET"
             | "DELETE" | "DETACH" | "WHERE" | "ORDER" | "BY" | "SKIP" | "LIMIT" | "ASC"
             | "DESC" | "AS" | "VECTOR_NN" | "VECTOR_SCORE" | "VECTOR_DISTANCE" | "TEXT_MATCH"
-            | "TEXT_SCORE" | "DROP" => Tok::Kw(s.to_ascii_uppercase()),
+            | "TEXT_SCORE" | "TAG_MATCH" | "DROP" => Tok::Kw(s.to_ascii_uppercase()),
             _ => Tok::Ident(s.into()),
         }
     }
@@ -580,6 +599,11 @@ impl Parser {
                     self.expect_ident("INDEX")?;
                     return Ok(Statement::CreateTextIndex(self.parse_create_text_index()?));
                 }
+                if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("TAG")) {
+                    self.bump();
+                    self.expect_ident("INDEX")?;
+                    return Ok(Statement::CreateTagIndex(self.parse_create_tag_index()?));
+                }
                 if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("VECTOR")) {
                     self.bump();
                     self.expect_ident("INDEX")?;
@@ -599,13 +623,18 @@ impl Parser {
                     self.expect_ident("INDEX")?;
                     return Ok(Statement::DropTextIndex(self.parse_drop_text_index()?));
                 }
+                if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("TAG")) {
+                    self.bump();
+                    self.expect_ident("INDEX")?;
+                    return Ok(Statement::DropTagIndex(self.parse_drop_tag_index()?));
+                }
                 if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("VECTOR")) {
                     self.bump();
                     self.expect_ident("INDEX")?;
                     return Ok(Statement::DropVectorIndex(self.parse_drop_vector_index()?));
                 }
                 Err(Error::Parse {
-                    message: "expected TEXT INDEX or VECTOR INDEX after DROP".into(),
+                    message: "expected TEXT, TAG, or VECTOR INDEX after DROP".into(),
                     position: None,
                 })
             }
@@ -732,6 +761,42 @@ impl Parser {
         };
         self.expect_tok(Tok::RParen, ")")?;
         Ok(DropTextIndex { label, property })
+    }
+
+    fn parse_create_tag_index(&mut self) -> Result<CreateTagIndex> {
+        let (label, property) = self.parse_index_target()?;
+        Ok(CreateTagIndex { label, property })
+    }
+
+    fn parse_drop_tag_index(&mut self) -> Result<DropTagIndex> {
+        let (label, property) = self.parse_index_target()?;
+        Ok(DropTagIndex { label, property })
+    }
+
+    fn parse_index_target(&mut self) -> Result<(String, String)> {
+        self.expect_ident("ON")?;
+        self.expect_tok(Tok::Colon, ":")?;
+        let label = if let Tok::Ident(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            return Err(Error::Parse {
+                message: "expected label name".into(),
+                position: None,
+            });
+        };
+        self.expect_tok(Tok::LParen, "(")?;
+        let property = if let Tok::Ident(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            return Err(Error::Parse {
+                message: "expected property name".into(),
+                position: None,
+            });
+        };
+        self.expect_tok(Tok::RParen, ")")?;
+        Ok((label, property))
     }
 
     fn parse_create_vector_index(&mut self) -> Result<CreateVectorIndex> {
@@ -1307,7 +1372,7 @@ impl Parser {
                 Ok(Expr::Literal(Value::Null))
             }
             Tok::Kw(k) => {
-                // Pseudo-functions tokenized as keywords: vector_nn, text_match, text_score
+                // Pseudo-functions tokenized as keywords.
                 self.bump(); // consume the keyword token
                 if k.eq_ignore_ascii_case("VECTOR_NN") && matches!(self.peek(), Tok::LParen) {
                     self.bump();
@@ -1357,6 +1422,30 @@ impl Parser {
                         variable: var,
                         property,
                         query,
+                    });
+                }
+                if k.eq_ignore_ascii_case("TAG_MATCH") && matches!(self.peek(), Tok::LParen) {
+                    self.bump();
+                    let (var, prop) = self.parse_var_with_prop()?;
+                    let property = prop.unwrap_or_default();
+                    self.expect_tok(Tok::Comma, ",")?;
+                    let tag = match self.peek().clone() {
+                        Tok::StrLit(t) => {
+                            self.bump();
+                            t
+                        }
+                        _ => {
+                            return Err(Error::Parse {
+                                message: "expected string tag in tag_match".into(),
+                                position: None,
+                            })
+                        }
+                    };
+                    self.expect_tok(Tok::RParen, ")")?;
+                    return Ok(Expr::TagMatch {
+                        variable: var,
+                        property,
+                        tag,
                     });
                 }
                 if k.eq_ignore_ascii_case("TEXT_SCORE") && matches!(self.peek(), Tok::LParen) {
@@ -1517,25 +1606,32 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
                 Some((var, distances, candidates)) => (Some(var), distances, Some(candidates)),
                 None => (None, HashMap::new(), None),
             };
+            let (tag_variable, tag_ids) = if let Some(where_) = &m.where_ {
+                match extract_tag_match(storage, where_, &m.patterns)? {
+                    Some((var, ids)) => (Some(var), ids),
+                    None => (None, HashSet::new()),
+                }
+            } else {
+                (None, HashSet::new())
+            };
 
             let mut current = state.rows.clone();
-            let vector_constraint = CandidateConstraint {
-                variable: vector_variable.as_deref(),
-                ids: vector_candidates.as_ref(),
-            };
-            let text_constraint = CandidateConstraint {
-                variable: text_variable.as_deref(),
-                ids: Some(&fts_rowids),
+            let constraints = CandidateConstraints {
+                vector: Some(CandidateConstraint {
+                    variable: vector_variable.as_deref(),
+                    ids: vector_candidates.as_ref(),
+                }),
+                text: Some(CandidateConstraint {
+                    variable: text_variable.as_deref(),
+                    ids: Some(&fts_rowids),
+                }),
+                tag: Some(CandidateConstraint {
+                    variable: tag_variable.as_deref(),
+                    ids: Some(&tag_ids),
+                }),
             };
             for pattern in &m.patterns {
-                current = execute_match(
-                    storage,
-                    pattern,
-                    &current,
-                    m.optional,
-                    vector_constraint,
-                    text_constraint,
-                )?;
+                current = execute_match(storage, pattern, &current, m.optional, constraints)?;
             }
 
             // Filter rows by the FTS rowid set (when a text_match was used) AND
@@ -1553,6 +1649,13 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
                                 .unwrap_or(false)
                         })
                     }
+                });
+            }
+            if let Some(var) = &tag_variable {
+                current.retain(|r| {
+                    row_node_id(r, var)
+                        .map(|id| tag_ids.contains(&id))
+                        .unwrap_or(false)
                 });
             }
             for row in &mut current {
@@ -1709,6 +1812,14 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
             )?;
             Ok(state)
         }
+        Statement::CreateTagIndex(cti) => {
+            storage.create_tag_index(&cti.label, &cti.property)?;
+            Ok(state)
+        }
+        Statement::DropTagIndex(dti) => {
+            storage.drop_tag_index(&dti.label, &dti.property)?;
+            Ok(state)
+        }
         Statement::CreateVectorIndex(cvi) => {
             let algorithm = cvi.algorithm.as_deref().unwrap_or("hnsw");
             storage.create_vector_index(&cvi.label, &cvi.property, algorithm, &cvi.options)?;
@@ -1726,6 +1837,7 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
 /// text_match.
 type TextMatchPredicate = (String, Vec<i64>, HashMap<i64, f32>);
 type VectorNnPredicate = (String, HashMap<i64, f32>, HashSet<i64>);
+type TagMatchPredicate = (String, HashSet<i64>);
 
 fn extract_text_match(
     storage: &Storage,
@@ -1806,6 +1918,98 @@ fn find_text_match(e: &Expr) -> Option<&Expr> {
         Expr::Not(a) => find_text_match(a),
         Expr::Cmp(a, _, b) => find_text_match(a).or_else(|| find_text_match(b)),
         _ => None,
+    }
+}
+
+/// Extract one or more `tag_match` predicates and intersect their rowid sets.
+/// All predicates must be top-level conjuncts and target the same variable.
+fn extract_tag_match(
+    storage: &Storage,
+    where_: &Expr,
+    patterns: &[Pattern],
+) -> Result<Option<TagMatchPredicate>> {
+    let mut matches = Vec::new();
+    if collect_tag_matches(where_, true, &mut matches) {
+        return Err(Error::Query(
+            "tag_match must be a top-level conjunct; use AND to combine tags".into(),
+        ));
+    }
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    let mut variable: Option<String> = None;
+    let mut ids: Option<HashSet<i64>> = None;
+    for expr in matches {
+        let Expr::TagMatch {
+            variable: var,
+            property,
+            tag,
+        } = expr
+        else {
+            continue;
+        };
+        if let Some(existing) = &variable {
+            if existing != var {
+                return Err(Error::Query(
+                    "multiple tag_match predicates must target the same variable".into(),
+                ));
+            }
+        } else {
+            variable = Some(var.clone());
+        }
+        if property.is_empty() {
+            return Err(Error::Query(format!(
+                "tag_match requires a tag property on '{var}' (e.g. tag_match({var}.tags, \"database\"))"
+            )));
+        }
+        let label = label_for_variable(patterns, var).ok_or_else(|| {
+            Error::Query(format!(
+                "tag_match requires a labeled node; '{var}' has no label"
+            ))
+        })?;
+        let found: HashSet<i64> = storage
+            .tag_search(&label, property, tag)?
+            .into_iter()
+            .collect();
+        ids = Some(match ids {
+            Some(mut acc) => {
+                acc.retain(|id| found.contains(id));
+                acc
+            }
+            None => found,
+        });
+    }
+
+    Ok(Some((
+        variable.ok_or_else(|| Error::Query("tag_match variable missing".into()))?,
+        ids.unwrap_or_default(),
+    )))
+}
+
+fn collect_tag_matches<'a>(e: &'a Expr, conjunctive: bool, out: &mut Vec<&'a Expr>) -> bool {
+    match e {
+        Expr::TagMatch { .. } => {
+            out.push(e);
+            !conjunctive
+        }
+        Expr::And(a, b) => {
+            let left = collect_tag_matches(a, conjunctive, out);
+            let right = collect_tag_matches(b, conjunctive, out);
+            left || right
+        }
+        Expr::Or(a, b) => {
+            let left = collect_tag_matches(a, false, out);
+            let right = collect_tag_matches(b, false, out);
+            left || right
+        }
+        Expr::Not(a) => collect_tag_matches(a, false, out),
+        Expr::Cmp(a, _, b) => {
+            let left = collect_tag_matches(a, false, out);
+            let right = collect_tag_matches(b, false, out);
+            left || right
+        }
+        _ => false,
     }
 }
 
@@ -1938,8 +2142,8 @@ struct CandidateConstraint<'a> {
     ids: Option<&'a HashSet<i64>>,
 }
 
-impl CandidateConstraint<'_> {
-    fn ids_for(&self, variable: &str) -> Option<&HashSet<i64>> {
+impl<'a> CandidateConstraint<'a> {
+    fn ids_for(&self, variable: &str) -> Option<&'a HashSet<i64>> {
         if self.variable == Some(variable) {
             self.ids
         } else {
@@ -1954,19 +2158,39 @@ impl CandidateConstraint<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Default)]
+struct CandidateConstraints<'a> {
+    vector: Option<CandidateConstraint<'a>>,
+    text: Option<CandidateConstraint<'a>>,
+    tag: Option<CandidateConstraint<'a>>,
+}
+
+impl<'a> CandidateConstraints<'a> {
+    fn iter(&self) -> impl Iterator<Item = CandidateConstraint<'a>> + '_ {
+        [self.vector, self.text, self.tag].into_iter().flatten()
+    }
+}
+
 fn execute_match(
     storage: &Storage,
     p: &Pattern,
     base_rows: &[Row],
     optional: bool,
-    vector_constraint: CandidateConstraint<'_>,
-    text_constraint: CandidateConstraint<'_>,
+    constraints: CandidateConstraints<'_>,
 ) -> Result<Vec<Row>> {
     let first_node = &p.segments[0].node;
-    // When an FTS predicate targets this variable, fetch only its matching
-    // rowids instead of materializing every labeled node and filtering after.
-    let mut nodes: Vec<Node> = if let Some(ids) = text_constraint.ids_for(&first_node.variable) {
+    // Pick the smallest predicate rowid set targeting this variable, then fetch
+    // only those nodes instead of materializing every labeled node. The other
+    // constraints are applied below.
+    let mut smallest: Option<&HashSet<i64>> = None;
+    for constraint in constraints.iter() {
+        if let Some(ids) = constraint.ids_for(&first_node.variable) {
+            if smallest.is_none_or(|current| ids.len() < current.len()) {
+                smallest = Some(ids);
+            }
+        }
+    }
+    let mut nodes: Vec<Node> = if let Some(ids) = smallest {
         let mut nodes = storage.list_nodes_by_ids(ids)?;
         if !first_node.labels.is_empty() {
             nodes.retain(|n| first_node.labels.iter().any(|l| n.labels.contains(l)));
@@ -1985,10 +2209,9 @@ fn execute_match(
         all.dedup_by_key(|n| n.id.0);
         all
     };
-    // The ANN candidate set constrains the scan when it targets this pattern's
-    // first node. Other patterns still evaluate normally (the executor
-    // intersects candidate sets at the row level afterwards).
-    vector_constraint.apply(&first_node.variable, &mut nodes);
+    for constraint in constraints.iter() {
+        constraint.apply(&first_node.variable, &mut nodes);
+    }
     // Apply inline property filters from the node pattern, e.g.
     // `MATCH (n:Person {name: "Alice"})`. Properties are matched against the
     // node's stored property map.
@@ -2326,6 +2549,7 @@ fn eval(e: &Expr, row: &Row) -> Value {
             Value::Bool(row.contains_key("__vector_distance__"))
         }
         Expr::TextMatch { .. } => Value::Bool(true),
+        Expr::TagMatch { .. } => Value::Bool(true),
         Expr::TextScore { variable } => {
             // The score for this row was injected by the executor; read it.
             // The variable name in the text_score expression identifies the

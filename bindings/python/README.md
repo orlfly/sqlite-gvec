@@ -48,6 +48,16 @@ print(g.run('''
     WHERE text_match(n.body, "hello") AND vector_nn(n.embedding, [0.1, 0.2], 5)
     RETURN n.title, text_score(n), vector_distance(n)
 '''))
+
+# Exact tag index and tag-aware hybrid query
+g.run('CREATE (t:Doc {title: "tagged", body: "hello rust", tags: ["database", "rust"]})')
+print(g.create_tag_index("Doc", "tags"))
+print(g.tag_search("Doc", "tags", "database"))
+print(g.run('''
+    MATCH (n:Doc)
+    WHERE tag_match(n.tags, "database") AND text_match(n.body, "hello")
+    RETURN n.title
+'''))
 ```
 
 ## Smoke test

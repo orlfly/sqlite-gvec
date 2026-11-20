@@ -172,6 +172,7 @@ impl Storage {
             ),
             &[],
         )?;
+        crate::tag::ensure_schema(self.exec.as_ref(), &self.prefix)?;
         Ok(())
     }
 
@@ -184,6 +185,8 @@ impl Storage {
             "auxiliary",
             "vectors",
             "vector_indexes",
+            "tags",
+            "tag_indexes",
         ];
         for n in names {
             let _ = self
@@ -305,6 +308,86 @@ impl Storage {
             }
         }
         out.sort_by_key(|n| n.id.0);
+        Ok(out)
+    }
+
+    // ---- Tag indexes ----
+
+    /// Create or rebuild an exact tag index over `label.property`.
+    pub fn create_tag_index(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<crate::tag::TagIndexMeta> {
+        crate::tag::create_tag_index(self.exec.as_ref(), &self.prefix, label, property)
+    }
+
+    /// Drop a tag index and its stored tags.
+    pub fn drop_tag_index(&self, label: &str, property: &str) -> Result<()> {
+        crate::tag::drop_tag_index(self.exec.as_ref(), &self.prefix, label, property)
+    }
+
+    /// List all tag indexes for this graph.
+    pub fn tag_indexes(&self) -> Result<Vec<crate::tag::TagIndexMeta>> {
+        crate::tag::list_tag_indexes(self.exec.as_ref(), &self.prefix)
+    }
+
+    /// Find a tag index by label and property.
+    pub fn find_tag_index(
+        &self,
+        label: &str,
+        property: &str,
+    ) -> Result<Option<crate::tag::TagIndexMeta>> {
+        crate::tag::find_tag_index(self.exec.as_ref(), &self.prefix, label, property)
+    }
+
+    /// Number of distinct nodes in a tag index. Returns zero if it does not exist.
+    pub fn tag_count(&self, label: &str, property: &str) -> Result<usize> {
+        let Some(meta) = self.find_tag_index(label, property)? else {
+            return Ok(0);
+        };
+        crate::tag::tag_count(self.exec.as_ref(), &self.prefix, meta.id)
+    }
+
+    /// Fetch every node id carrying `tag`. Falls back to a property scan when
+    /// no tag index exists.
+    pub fn tag_search(&self, label: &str, property: &str, tag: &str) -> Result<Vec<i64>> {
+        self.tag_search_limit(label, property, tag, None)
+    }
+
+    /// Fetch up to `k` node ids carrying `tag`. `None` means no limit.
+    pub fn tag_search_limit(
+        &self,
+        label: &str,
+        property: &str,
+        tag: &str,
+        k: Option<usize>,
+    ) -> Result<Vec<i64>> {
+        if k == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let Some(meta) = self.find_tag_index(label, property)? {
+            return crate::tag::tag_search_ids(self.exec.as_ref(), &self.prefix, meta.id, tag, k);
+        }
+        let mut ids = self.exact_tag_search(label, property, tag)?;
+        if let Some(k) = k {
+            ids.truncate(k);
+        }
+        Ok(ids)
+    }
+
+    /// Exact tag scan used when no tag index is defined.
+    pub fn exact_tag_search(&self, label: &str, property: &str, tag: &str) -> Result<Vec<i64>> {
+        let mut out = Vec::new();
+        for node in self.list_nodes_by_label(label)? {
+            let Some(value) = crate::property::resolve(&node.properties, property) else {
+                continue;
+            };
+            if crate::tag::value_has_tag(value, tag) {
+                out.push(node.id.0);
+            }
+        }
+        out.sort_unstable();
         Ok(out)
     }
 
@@ -944,7 +1027,7 @@ fn json_to_string(v: &Value) -> Result<String> {
 /// Validate a label/property name before it is interpolated into DDL. The
 /// query language restricts these to plain identifiers, matching the FTS
 /// surface.
-fn validate_ident(kind: &str, s: &str) -> Result<()> {
+pub(crate) fn validate_ident(kind: &str, s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(Error::Parse {
             message: format!("{kind} must not be empty"),

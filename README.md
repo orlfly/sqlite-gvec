@@ -13,6 +13,8 @@ database that runs on top of any SQLite build. It exposes:
   and `text_match(...)` rowid-set constraints
 - Full-text search through SQLite FTS5 with BM25 ranking (`CREATE TEXT INDEX`,
   `text_match`, `text_score`)
+- Exact tag indexes with `CREATE TAG INDEX` and `tag_match`, composable with
+  graph, text, and vector predicates
 - A pure Rust API (`gvec` crate) that embeds SQLite via `rusqlite`
 - A loadable SQLite extension (`gvec_extension` crate) that registers
   `gvec_version()`, `gvec_dist()`, and a `gvec_query()` stub (see "scope")
@@ -26,8 +28,8 @@ as design inspiration.
 
 | Crate | Description | Status |
 | --- | --- | --- |
-| `gvec-core` | Storage, HNSW/IVF/Flat indexes, Cypher parser/executor, FTS, fusion | ✅ implemented (27 tests) |
-| `gvec` | In-process Rust binding over `rusqlite` | ✅ implemented (33 tests) |
+| `gvec-core` | Storage, HNSW/IVF/Flat indexes, tag indexes, Cypher parser/executor, FTS, fusion | ✅ implemented (29 tests) |
+| `gvec` | In-process Rust binding over `rusqlite` | ✅ implemented (50 tests) |
 | `gvec-python` | PyO3 Python extension (`gvec._gvec`) | ✅ implemented (smoke tested) |
 | `gvec-extension` | Loadable SQLite extension via `sqlite-loadable` | ✅ entry point + scalars (1 test) |
 
@@ -51,9 +53,9 @@ let rs = g.run("MATCH (n:Person) WHERE n.age > 20 RETURN n.name AS name ORDER BY
 assert_eq!(rs.rows.len(), 2);
 
 // Persistent ANN index over a node property
-g.run(r#"CREATE (a:Doc {title: "origin", body: "the rust programming language", embedding: [0.0, 0.0]})"#).unwrap();
-g.run(r#"CREATE (b:Doc {title: "near",   body: "python is dynamic",              embedding: [1.0, 0.0]})"#).unwrap();
-g.run(r#"CREATE (c:Doc {title: "far",    body: "unrelated notes",               embedding: [5.0, 5.0]})"#).unwrap();
+g.run(r#"CREATE (a:Doc {title: "origin", body: "the rust programming language", tags: ["database", "rust"], embedding: [0.0, 0.0]})"#).unwrap();
+g.run(r#"CREATE (b:Doc {title: "near",   body: "python is dynamic",              tags: ["python"],             embedding: [1.0, 0.0]})"#).unwrap();
+g.run(r#"CREATE (c:Doc {title: "far",    body: "unrelated notes",               tags: ["notes"],              embedding: [5.0, 5.0]})"#).unwrap();
 
 g.create_vector_index("Doc", "embedding", "hnsw", Some("l2"), None).unwrap();
 
@@ -83,6 +85,11 @@ let rs = g.run(r#"
     ORDER BY distance ASC
 "#).unwrap();
 assert_eq!(rs.rows.len(), 1);
+
+// Exact tag index, usable alone or with text/vector predicates
+g.create_tag_index("Doc", "tags").unwrap();
+let rs = g.run(r#"MATCH (n:Doc) WHERE tag_match(n.tags, "database") RETURN n.title AS title"#).unwrap();
+assert_eq!(rs.rows[0][0], "origin");
 ```
 
 ### Vector index algorithms
@@ -184,6 +191,59 @@ every text hit before `LIMIT`, while `text_search` returns only k rows. Use
 combined with graph or vector predicates. All eight benchmark result sets were
 verified against a naive token scan.
 
+## Tag indexes
+
+Tags are exact, case-sensitive values stored as a JSON string or array:
+
+```rust
+g.create_tag_index("Doc", "tags")?;
+let rs = g.run(r#"
+    MATCH (n:Doc)
+    WHERE tag_match(n.tags, "database") AND text_match(n.body, "rust")
+    RETURN n.title, text_score(n) AS score
+    ORDER BY score DESC
+"#)?;
+```
+
+`CREATE TAG INDEX ON :Doc(tags)` builds a persisted `(index, node, tag)` table
+with trigger-based maintenance. Inserts, updates, deletes, and label changes
+stay in sync. Multiple `tag_match` predicates on the same variable under `AND`
+intersect their result sets. `OR`, `NOT`, and predicates on different variables
+are rejected with an explicit error because rowid pre-filtering would change
+semantics.
+
+Tag matching is exact: `data` does not match `database`, and `Database` does not
+match `database`. Numeric tag values are compared through their decimal string
+form. When no tag index exists, `tag_match` falls back to scanning the property,
+so the feature is usable before DDL and after `DROP TAG INDEX`.
+
+`vector_nn(...) AND tag_match(...)` filters the ANN candidates after retrieval,
+so a selective tag can return fewer than k rows. A future iteration can pass an
+allowed-id set into the ANN search.
+
+### Tag benchmark
+
+```bash
+cargo run --release -p gvec --example tag_bench
+```
+
+Deterministic Zipf tags, three tags per document, 50k docs. `direct` is
+`Graph::tag_search(..., k=10)`, `cypher` is `tag_match + LIMIT 10`. Fallback
+rows run after dropping the index.
+
+| Query | Matches | Indexed direct | Indexed Cypher | Fallback direct | Fallback Cypher |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| common tag | 22,361 | 0.012 ms | 136.8 ms | 73.4 ms | 201.4 ms |
+| medium tag | 1,893 | 0.011 ms | 9.24 ms | 73.6 ms | 77.4 ms |
+| rare tag | 75 | 0.013 ms | 0.329 ms | n/a | n/a |
+| text + tag | 5,588 | n/a | 71.3 ms | n/a | n/a |
+
+Index build: 241 ms for 50k docs (4.8 us/doc), 8.45 MB (177 bytes/doc). At 10k
+docs the build takes 60 ms and 1.59 MB. The indexed rowid lookup is
+microseconds; Cypher still materializes every matching node before `LIMIT`, so
+broad tags scale with match count. All tag result sets were verified against a
+naive scan.
+
 ## Quick start (SQLite extension)
 
 ```bash
@@ -215,7 +275,7 @@ loadable SQLite extension is required.
 
 ```
 crates/
-  gvec-core/         # pure Rust: storage, vector, vector_index (HNSW/IVF), query, fts, fusion
+  gvec-core/         # pure Rust: storage, vector, vector_index (HNSW/IVF), tag, query, fts, fusion
   gvec-bindings/     # in-process Rust API over rusqlite
   gvec-python/       # PyO3 extension module (built with maturin)
   gvec-extension/    # loadable SQLite extension (cdylib)
@@ -235,15 +295,16 @@ CI enforces this with a grep on `Cargo.toml` and `Cargo.lock`.
 ## Scope & non-goals
 
 - **In scope (v0.2)**: shadow-table node/edge storage, vector encoding
-  (f32/i8/binary), persistent HNSW/IVF/Flat indexes, KNN and hybrid graph +
-  vector + text queries, the GQL subset listed above, variable-length
-  patterns, Rust binding via `rusqlite`, scalar surface of the loadable
-  extension, Rust/PyO3 Python binding.
+  (f32/i8/binary), persistent HNSW/IVF/Flat indexes, exact tag indexes, KNN
+  and hybrid graph + vector + text + tag queries, the GQL subset listed above,
+  variable-length patterns, Rust binding via `rusqlite`, scalar surface of the
+  loadable extension, Rust/PyO3 Python binding.
 - **Out of scope (v0.1)**: full virtual-table implementation in the
   loadable extension (the `gvec0` vtab is exposed via the Rust binding;
   the extension exposes scalars only — see notes in
   `crates/gvec-extension/src/lib.rs`), product/scalar quantization
-  (IVF-PQ), full Neo4j Cypher conformance, distributed storage.
+  (IVF-PQ), exact filtered-vector top-k, case-insensitive tag normalization,
+  full Neo4j Cypher conformance, distributed storage.
 
 ## Tests
 

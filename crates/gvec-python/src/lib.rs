@@ -1,9 +1,9 @@
 //! Python bindings for gvec, implemented in Rust with PyO3.
 //!
 //! This module replaces the previous ctypes/`sqlite3` Python wrapper. The
-//! entire engine, including graph queries, FTS, and HNSW/IVF vector indexes,
-//! runs in-process through the `gvec` Rust binding; Python only receives
-//! converted result values.
+//! entire engine, including graph queries, FTS, tag indexes, and HNSW/IVF
+//! vector indexes, runs in-process through the `gvec` Rust binding; Python only
+//! receives converted result values.
 //!
 //! Build with `maturin develop` (see `pyproject.toml`) or manually:
 //!
@@ -16,8 +16,8 @@
 //! Import from Python as `from gvec import Database, Vector, Distance`.
 
 use gvec::{
-    Database as RustDatabase, Distance as CoreDistance, Graph as RustGraph, VectorIndexMeta,
-    VectorValue,
+    Database as RustDatabase, Distance as CoreDistance, Graph as RustGraph, TagIndexMeta,
+    VectorIndexMeta, VectorValue,
 };
 use pyo3::conversion::IntoPyObjectExt;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -366,6 +366,50 @@ impl Graph {
             .text_search(label, property, query, k)
             .map_err(to_pyerr)
     }
+
+    /// Create or rebuild an exact tag index over `label.property`.
+    fn create_tag_index(&self, py: Python<'_>, label: &str, property: &str) -> PyResult<Py<PyAny>> {
+        let index = self
+            .inner_graph
+            .create_tag_index(label, property)
+            .map_err(to_pyerr)?;
+        tag_meta_to_py(py, index)
+    }
+
+    fn drop_tag_index(&self, label: &str, property: &str) -> PyResult<()> {
+        self.inner_graph
+            .drop_tag_index(label, property)
+            .map_err(to_pyerr)
+    }
+
+    fn list_tag_indexes(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let indexes = self.inner_graph.list_tag_indexes().map_err(to_pyerr)?;
+        indexes
+            .into_iter()
+            .map(|index| tag_meta_to_py(py, index))
+            .collect()
+    }
+
+    fn tag_count(&self, label: &str, property: &str) -> PyResult<usize> {
+        self.inner_graph
+            .tag_count(label, property)
+            .map_err(to_pyerr)
+    }
+
+    #[pyo3(signature = (label, property, tag, k = 10))]
+    fn tag_search(&self, label: &str, property: &str, tag: &str, k: usize) -> PyResult<Vec<i64>> {
+        self.inner_graph
+            .tag_search(label, property, tag, k)
+            .map_err(to_pyerr)
+    }
+}
+
+fn tag_meta_to_py(py: Python<'_>, index: TagIndexMeta) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", index.id)?;
+    dict.set_item("label", index.label)?;
+    dict.set_item("property", index.property)?;
+    dict.into_py_any(py)
 }
 
 fn index_meta_to_py(py: Python<'_>, index: VectorIndexMeta) -> PyResult<Py<PyAny>> {
