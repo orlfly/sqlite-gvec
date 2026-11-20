@@ -17,6 +17,7 @@ pub mod query;
 pub mod sql;
 pub mod storage;
 pub mod vector;
+pub mod vector_index;
 
 pub mod prelude {
     pub use crate::edge::{Edge, EdgeRecord};
@@ -25,8 +26,12 @@ pub mod prelude {
     pub use crate::ids::{EdgeId, NodeId};
     pub use crate::node::{Node, NodeRecord};
     pub use crate::sql::{SqlExecutor, SqlValue};
-    pub use crate::storage::{Storage, StorageSnapshot};
+    pub use crate::storage::{Storage, StorageSnapshot, VectorIndexMeta};
     pub use crate::vector::{Distance, ElementType, VectorBlob, VectorValue};
+    pub use crate::vector_index::{
+        FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
+        VectorIndexConfig,
+    };
 }
 
 pub use edge::{Edge, EdgeRecord};
@@ -35,5 +40,9 @@ pub use fts::{fts_table_name, Tokenizer};
 pub use ids::{EdgeId, NodeId};
 pub use node::{Node, NodeRecord};
 pub use sql::{SqlExecutor, SqlValue};
-pub use storage::{Storage, StorageSnapshot};
+pub use storage::{Storage, StorageSnapshot, VectorIndexMeta};
 pub use vector::{Distance, ElementType, VectorBlob, VectorValue};
+pub use vector_index::{
+    FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
+    VectorIndexConfig,
+};

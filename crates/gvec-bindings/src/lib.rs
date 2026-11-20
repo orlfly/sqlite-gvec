@@ -3,9 +3,15 @@
 //! Embeds SQLite via `rusqlite` and exposes graph + vector operations as a
 //! pure Rust API. No FFI to the host — the entire engine lives in this crate.
 
-use gvec_core::error::{Error, Result};
+pub use gvec_core::error::{Error, Result};
 use gvec_core::sql::{SqlExecutor, SqlValue};
 use gvec_core::storage::Storage;
+pub use gvec_core::storage::VectorIndexMeta;
+pub use gvec_core::vector::{Distance, ElementType, VectorBlob, VectorValue};
+pub use gvec_core::vector_index::{
+    FlatIndex, HnswIndex, HnswParams, IvfIndex, IvfParams, VectorIndex, VectorIndexAlgorithm,
+    VectorIndexConfig,
+};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
@@ -56,7 +62,7 @@ impl SqlExecutor for SharedConn {
             .iter()
             .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
             .collect();
-        Ok(conn.execute(sql, &refs[..]).map_err(sqlite_err)?)
+        conn.execute(sql, &refs[..]).map_err(sqlite_err)
     }
     fn query_one_json(&self, sql: &str, p: &[SqlValue]) -> Result<Option<Vec<serde_json::Value>>> {
         let conn = self
@@ -74,7 +80,7 @@ impl SqlExecutor for SharedConn {
             let n = row.as_ref().column_count();
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
-                out.push(col_to_json(&row, i));
+                out.push(col_to_json(row, i));
             }
             return Ok(Some(out));
         }
@@ -157,9 +163,9 @@ pub struct Graph {
 impl Graph {
     /// Run a Cypher-like query.
     pub fn run(&self, cypher: &str) -> Result<gvec_core::query::ResultSet> {
-        let mut p = gvec_core::query::Parser::new(cypher).map_err(Error::from)?;
-        let q = p.parse_query().map_err(Error::from)?;
-        gvec_core::query::execute(&self.storage, &q).map_err(Error::from)
+        let mut p = gvec_core::query::Parser::new(cypher)?;
+        let q = p.parse_query()?;
+        gvec_core::query::execute(&self.storage, &q)
     }
 
     pub fn knn(
@@ -170,6 +176,72 @@ impl Graph {
         dist: gvec_core::vector::Distance,
     ) -> Vec<(i64, f32)> {
         gvec_core::vector::knn_search(query, stored, k, dist)
+    }
+
+    /// Create (or reconfigure and reindex) an ANN vector index over
+    /// `label.property`.
+    ///
+    /// `algorithm` is `flat`, `hnsw`, or `ivf`. `metric` is `l2`, `cosine`, or
+    /// `ip`. `options` is an optional JSON object with algorithm parameters
+    /// (`m`, `ef_construction`, `ef_search`, `nlist`, `nprobe`).
+    pub fn create_vector_index(
+        &self,
+        label: &str,
+        property: &str,
+        algorithm: &str,
+        metric: Option<&str>,
+        options: Option<serde_json::Value>,
+    ) -> Result<VectorIndexMeta> {
+        let mut opts: Vec<(String, serde_json::Value)> = Vec::new();
+        if let Some(serde_json::Value::Object(map)) = options {
+            for (k, v) in map {
+                opts.push((k, v));
+            }
+        }
+        if let Some(metric) = metric {
+            opts.retain(|(k, _)| k != "metric");
+            opts.push(("metric".into(), serde_json::Value::String(metric.into())));
+        }
+        self.storage
+            .create_vector_index(label, property, algorithm, &opts)
+    }
+
+    pub fn drop_vector_index(&self, label: &str, property: &str) -> Result<()> {
+        self.storage.drop_vector_index(label, property)
+    }
+
+    pub fn list_vector_indexes(&self) -> Result<Vec<VectorIndexMeta>> {
+        self.storage.vector_indexes()
+    }
+
+    pub fn vector_count(&self, label: &str, property: &str) -> Result<usize> {
+        self.storage.vector_count(label, property)
+    }
+
+    /// ANN search over `label.property`. Uses the configured index (HNSW by
+    /// default) and falls back to an exact L2 scan when no index exists.
+    pub fn vector_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &VectorValue,
+        k: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        self.storage.vector_search(label, property, query, k)
+    }
+
+    /// Exact scan using the requested metric, useful for recall checks and
+    /// when the user has not created an index.
+    pub fn exact_vector_search(
+        &self,
+        label: &str,
+        property: &str,
+        query: &VectorValue,
+        k: usize,
+        metric: Distance,
+    ) -> Result<Vec<(i64, f32)>> {
+        self.storage
+            .exact_vector_search(label, property, query, k, metric)
     }
 
     /// Create an FTS5 text index over `label.property`. Returns an error if the
@@ -623,5 +695,321 @@ mod tests {
             .run("MATCH (n:Person) RETURN n.name AS name ORDER BY n.age ASC")
             .unwrap();
         assert_eq!(rs.rows.len(), 2);
+    }
+
+    // ---- Vector index (ANN) integration tests ----
+
+    #[test]
+    fn vector_index_knn_via_cypher() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "origin", embedding: [0.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "near", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (c:Doc {title: "far", embedding: [5.0, 5.0]})"#)
+            .unwrap();
+        g.create_vector_index("Doc", "embedding", "hnsw", Some("l2"), None)
+            .unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [0.0, 0.0], 2)
+                   RETURN n.title AS title, vector_distance(n) AS distance"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 2, "rows: {:?}", rs.rows);
+        assert_eq!(rs.rows[0][0], json!("origin"));
+        assert_eq!(rs.rows[1][0], json!("near"));
+        let d0 = rs.rows[0][1].as_f64().unwrap();
+        let d1 = rs.rows[1][1].as_f64().unwrap();
+        assert!(d0 < d1, "expected ascending distance, got {d0} then {d1}");
+    }
+
+    #[test]
+    fn vector_index_is_maintained_on_node_create_update_delete() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        // Create the index before any node exists: vectors must be picked up
+        // by subsequent inserts.
+        g.create_vector_index("Doc", "embedding", "flat", None, None)
+            .unwrap();
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 0);
+
+        g.run(r#"CREATE (a:Doc {title: "a", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "b", embedding: [2.0, 0.0]})"#)
+            .unwrap();
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 2);
+
+        // SET updates the stored vector through Storage::update_node.
+        g.run(r#"MATCH (n:Doc {title: "a"}) SET n.embedding = [9.0, 9.0]"#)
+            .unwrap();
+        let rs = g
+            .vector_search("Doc", "embedding", &VectorValue::F32(vec![9.0, 9.0]), 1)
+            .unwrap();
+        assert_eq!(rs[0].0, 1, "updated node a should be nearest");
+
+        // DELETE removes the vector row.
+        g.run(r#"MATCH (n:Doc {title: "a"}) DELETE n"#).unwrap();
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 1);
+    }
+
+    #[test]
+    fn vector_index_persists_across_reopen() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vectors.db");
+        let path = path.to_str().unwrap().to_string();
+
+        {
+            let db = Database::open(&path).unwrap();
+            let g = db.graph("persist").unwrap();
+            g.run(r#"CREATE (a:Doc {title: "a", embedding: [0.0, 0.0]})"#)
+                .unwrap();
+            g.run(r#"CREATE (b:Doc {title: "b", embedding: [4.0, 4.0]})"#)
+                .unwrap();
+            g.create_vector_index("Doc", "embedding", "hnsw", Some("l2"), None)
+                .unwrap();
+            assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 2);
+        }
+
+        let db = Database::open(&path).unwrap();
+        let g = db.graph("persist").unwrap();
+        let indexes = g.list_vector_indexes().unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].algorithm, "hnsw");
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 2);
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [0.1, 0.1], 1)
+                   RETURN n.title AS title"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0][0], json!("a"));
+    }
+
+    #[test]
+    fn vector_index_ddl_ivf_and_drop() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        for i in 0..8 {
+            g.run(&format!(
+                r#"CREATE (n:Doc {{i: {i}, embedding: [{i}.0, {}]}})"#,
+                (i * 2) as f32
+            ))
+            .unwrap();
+        }
+        g.run(
+            r#"CREATE VECTOR INDEX ON :Doc(embedding)
+               USING IVF(nlist = 4, nprobe = 2, metric = "cosine")"#,
+        )
+        .unwrap();
+        let indexes = g.list_vector_indexes().unwrap();
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].algorithm, "ivf");
+        assert_eq!(indexes[0].metric, "cosine");
+        assert_eq!(indexes[0].dim, Some(2));
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 8);
+
+        // DDL-created indexes are used by vector_nn.
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [0.0, 0.0], 2)
+                   RETURN n.i AS i"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 2);
+
+        g.run("DROP VECTOR INDEX ON :Doc(embedding)").unwrap();
+        assert!(g.list_vector_indexes().unwrap().is_empty());
+        // Without an index, vector_nn falls back to an exact scan and still
+        // works for small data sets.
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [0.0, 0.0], 1)
+                   RETURN n.i AS i"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 1);
+    }
+
+    #[test]
+    fn vector_index_hybrid_text_and_vector() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "rust db", body: "the rust database is fast", embedding: [1.0, 0.0]})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {title: "rust async", body: "rust async runtime", embedding: [0.9, 0.1]})"#).unwrap();
+        g.run(
+            r#"CREATE (c:Doc {title: "python", body: "python is dynamic", embedding: [0.0, 1.0]})"#,
+        )
+        .unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        g.create_vector_index("Doc", "embedding", "hnsw", Some("l2"), None)
+            .unwrap();
+
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc)
+                   WHERE text_match(n.body, "rust") AND vector_nn(n.embedding, [1.0, 0.0], 3)
+                   RETURN n.title AS title, text_score(n) AS score, vector_distance(n) AS distance
+                   ORDER BY distance ASC"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows.len(), 2, "rows: {:?}", rs.rows);
+        let titles: Vec<&str> = rs.rows.iter().map(|r| r[0].as_str().unwrap()).collect();
+        assert_eq!(titles, vec!["rust db", "rust async"]);
+        assert!(rs.rows[0][1].as_f64().unwrap() > 0.0);
+        assert!(rs.rows[0][2].as_f64().unwrap() <= rs.rows[1][2].as_f64().unwrap());
+    }
+
+    #[test]
+    fn vector_index_rejects_dimension_mismatch() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "a", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "b", embedding: [0.0, 1.0]})"#)
+            .unwrap();
+        g.create_vector_index("Doc", "embedding", "hnsw", None, None)
+            .unwrap();
+
+        let err = g
+            .run(r#"CREATE (c:Doc {title: "c", embedding: [1.0, 2.0, 3.0]})"#)
+            .unwrap_err();
+        assert!(format!("{err}").contains("dimension"), "got: {err}");
+
+        // The invalid node must not have been written.
+        let rs = g.run("MATCH (n:Doc) RETURN n.title AS title").unwrap();
+        assert_eq!(rs.rows.len(), 2);
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 2);
+    }
+
+    #[test]
+    fn vector_index_supports_int8_vectors() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        let create = |values: Vec<i64>| {
+            g.storage
+                .create_node(
+                    &["Doc".to_string()],
+                    &json!({"v": {"type": "int8", "values": values}}),
+                )
+                .unwrap()
+        };
+        create(vec![1, 2, 3]);
+        create(vec![10, 10, 10]);
+        create(vec![1, 2, 4]);
+        g.create_vector_index("Doc", "v", "hnsw", Some("l2"), None)
+            .unwrap();
+
+        let results = g
+            .vector_search("Doc", "v", &VectorValue::I8(vec![1, 2, 3]), 2)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn vector_index_cosine_metric() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "east", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "north", embedding: [0.0, 1.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (c:Doc {title: "west", embedding: [-1.0, 0.0]})"#)
+            .unwrap();
+        g.create_vector_index("Doc", "embedding", "hnsw", Some("cosine"), None)
+            .unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [2.0, 0.0], 2)
+                   RETURN n.title AS title"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows[0][0], json!("east"));
+        assert_eq!(rs.rows[1][0], json!("north"));
+    }
+
+    #[test]
+    fn vector_index_recreate_is_idempotent_and_rebuilds() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "a", embedding: [0.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "b", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE VECTOR INDEX ON :Doc(embedding)"#).unwrap();
+        // Re-running DDL must not duplicate metadata or vectors.
+        g.run(r#"CREATE VECTOR INDEX ON :Doc(embedding)"#).unwrap();
+        assert_eq!(g.list_vector_indexes().unwrap().len(), 1);
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 2);
+
+        // A node added between the two calls is picked up by the reindex.
+        g.run(r#"CREATE (c:Doc {title: "c", embedding: [2.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE VECTOR INDEX ON :Doc(embedding)"#).unwrap();
+        assert_eq!(g.vector_count("Doc", "embedding").unwrap(), 3);
+    }
+
+    #[test]
+    fn vector_index_default_ddl_algorithm_is_hnsw_l2() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {embedding: [1.0, 0.0]})"#).unwrap();
+        g.run(r#"CREATE VECTOR INDEX ON :Doc(embedding)"#).unwrap();
+        let indexes = g.list_vector_indexes().unwrap();
+        assert_eq!(indexes[0].algorithm, "hnsw");
+        assert_eq!(indexes[0].metric, "l2");
+    }
+
+    #[test]
+    fn array_literals_in_return() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "a", score: 0.5})"#).unwrap();
+        let rs = g
+            .run("MATCH (n:Doc) RETURN [n.title, n.score] AS pair")
+            .unwrap();
+        assert_eq!(rs.rows[0][0], json!(["a", 0.5]));
+    }
+
+    #[test]
+    fn explicit_order_by_overrides_distance_order() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {title: "z", embedding: [0.0, 0.0]})"#)
+            .unwrap();
+        g.run(r#"CREATE (b:Doc {title: "a", embedding: [1.0, 0.0]})"#)
+            .unwrap();
+        g.create_vector_index("Doc", "embedding", "flat", None, None)
+            .unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE vector_nn(n.embedding, [0.0, 0.0], 2)
+                   RETURN n.title AS title ORDER BY title ASC"#,
+            )
+            .unwrap();
+        assert_eq!(rs.rows[0][0], json!("a"));
+        assert_eq!(rs.rows[1][0], json!("z"));
+    }
+
+    #[test]
+    fn text_match_with_zero_hits_returns_no_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let g = db.graph("test").unwrap();
+        g.run(r#"CREATE (a:Doc {body: "rust database"})"#).unwrap();
+        g.run(r#"CREATE (b:Doc {body: "python runtime"})"#).unwrap();
+        g.create_text_index("Doc", "body", None).unwrap();
+        let rs = g
+            .run(
+                r#"MATCH (n:Doc) WHERE text_match(n.body, "nonexistentterm")
+                   RETURN n.body AS body"#,
+            )
+            .unwrap();
+        assert!(rs.rows.is_empty(), "expected no rows, got {:?}", rs.rows);
     }
 }

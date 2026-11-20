@@ -22,10 +22,28 @@ pub const VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 #[sqlite_entrypoint]
 pub fn sqlite3_gvec_init(db: *mut sqlite3) -> Result<()> {
     let _ = db;
-    define_scalar_function(db, "gvec_version", 0, gvec_version, FunctionFlags::UTF8 | FunctionFlags::DETERMINISTIC)?;
-    define_scalar_function(db, "gvec_dist", 3, gvec_dist, FunctionFlags::UTF8 | FunctionFlags::DETERMINISTIC)?;
+    define_scalar_function(
+        db,
+        "gvec_version",
+        0,
+        gvec_version,
+        FunctionFlags::UTF8 | FunctionFlags::DETERMINISTIC,
+    )?;
+    define_scalar_function(
+        db,
+        "gvec_dist",
+        3,
+        gvec_dist,
+        FunctionFlags::UTF8 | FunctionFlags::DETERMINISTIC,
+    )?;
     define_scalar_function(db, "gvec_query", 1, gvec_query_stub, FunctionFlags::UTF8)?;
-    define_scalar_function(db, "gvec_text_search", 5, gvec_text_search_stub, FunctionFlags::UTF8)?;
+    define_scalar_function(
+        db,
+        "gvec_text_search",
+        5,
+        gvec_text_search_stub,
+        FunctionFlags::UTF8,
+    )?;
     Ok(())
 }
 
@@ -35,12 +53,15 @@ fn gvec_version(context: *mut sqlite3_context, _values: &[*mut sqlite3_value]) -
 }
 
 fn gvec_dist(context: *mut sqlite3_context, values: &[*mut sqlite3_value]) -> Result<()> {
-    let a = parse_vector_arg(values.get(0).copied());
+    let a = parse_vector_arg(values.first().copied());
     let b = parse_vector_arg(values.get(1).copied());
     let metric = api::value_text(values.get(2).expect("metric"))?.to_string();
     let dist = match Distance::parse(&metric) {
         Some(d) => d,
-        None => { api::result_error(context, &format!("unknown metric: {metric}")); return Ok(()); }
+        None => {
+            let _ = api::result_error(context, &format!("unknown metric: {metric}"));
+            return Ok(());
+        }
     };
     match (a, b) {
         (Ok(va), Ok(vb)) => {
@@ -48,7 +69,10 @@ fn gvec_dist(context: *mut sqlite3_context, values: &[*mut sqlite3_value]) -> Re
             api::result_double(context, r as f64);
             Ok(())
         }
-        (Err(e), _) | (_, Err(e)) => { api::result_error(context, &format!("{e}")); Ok(()) }
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = api::result_error(context, &format!("{e}"));
+            Ok(())
+        }
     }
 }
 
@@ -58,7 +82,7 @@ fn gvec_dist(context: *mut sqlite3_context, values: &[*mut sqlite3_value]) -> Re
 /// `gvec-core` and requires an owned `rusqlite::Connection` which a
 /// loadable scalar function does not have. See `crates/gvec-bindings`.
 fn gvec_query_stub(context: *mut sqlite3_context, _values: &[*mut sqlite3_value]) -> Result<()> {
-    api::result_error(context, "gvec_query requires the gvec Rust binding crate (https://crates.io/crates/gvec); the loadable extension exposes scalar functions only");
+    let _ = api::result_error(context, "gvec_query requires the gvec Rust binding crate (https://crates.io/crates/gvec); the loadable extension exposes scalar functions only");
     Ok(())
 }
 
@@ -67,12 +91,17 @@ fn gvec_query_stub(context: *mut sqlite3_context, _values: &[*mut sqlite3_value]
 /// pointing users at the Rust binding. The actual FTS5 search requires an
 /// owned `rusqlite::Connection` which a loadable scalar function does not
 /// have (see notes on `gvec_query_stub` above).
-fn gvec_text_search_stub(context: *mut sqlite3_context, _values: &[*mut sqlite3_value]) -> Result<()> {
-    api::result_error(context, "gvec_text_search requires the gvec Rust binding crate; the loadable extension exposes scalar functions only");
+fn gvec_text_search_stub(
+    context: *mut sqlite3_context,
+    _values: &[*mut sqlite3_value],
+) -> Result<()> {
+    let _ = api::result_error(context, "gvec_text_search requires the gvec Rust binding crate; the loadable extension exposes scalar functions only");
     Ok(())
 }
 
-fn parse_vector_arg(v: Option<*mut sqlite3_value>) -> std::result::Result<VectorValue, gvec_core::Error> {
+fn parse_vector_arg(
+    v: Option<*mut sqlite3_value>,
+) -> std::result::Result<VectorValue, gvec_core::Error> {
     let v = v.expect("vector arg");
     let s = sqlite_loadable::api::value_text_notnull(&v)
         .map_err(|e| gvec_core::Error::Vector(e.to_string()))?

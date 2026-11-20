@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
@@ -7,6 +8,16 @@ pub enum ElementType {
     Float32,
     Int8,
     Binary,
+}
+
+impl ElementType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ElementType::Float32 => "float32",
+            ElementType::Int8 => "int8",
+            ElementType::Binary => "binary",
+        }
+    }
 }
 
 /// Logical vector value carried in memory. Binary is bit-packed into bytes.
@@ -31,6 +42,127 @@ impl VectorValue {
             VectorValue::F32(_) => ElementType::Float32,
             VectorValue::I8(_) => ElementType::Int8,
             VectorValue::Bits(_) => ElementType::Binary,
+        }
+    }
+
+    /// Parse a vector from the JSON shapes accepted by the query language and
+    /// storage layer:
+    ///
+    /// - `[1.0, 2.0, ...]` -> `Float32`
+    /// - `"0000803f00000040"` (hex) -> `Float32` when 4-byte aligned, else `Int8`
+    /// - `{"type": "float32"|"f32", "values": [...]}`
+    /// - `{"type": "int8", "values": [...]}`
+    /// - `{"type": "binary", "bits": [...]}` or `{"type":"binary","hex":"..."}`
+    pub fn from_json(v: &Value) -> Result<Self> {
+        match v {
+            Value::Array(xs) => {
+                let mut out = Vec::with_capacity(xs.len());
+                for x in xs {
+                    match x {
+                        Value::Number(n) => out.push(n.as_f64().unwrap_or(0.0) as f32),
+                        Value::Null => out.push(0.0),
+                        _ => return Err(Error::Vector("expected a JSON array of numbers".into())),
+                    }
+                }
+                Ok(VectorValue::F32(out))
+            }
+            Value::String(s) => {
+                if let Ok(bytes) = hex_decode(s) {
+                    if bytes.len() % 4 == 0 {
+                        let mut out = Vec::with_capacity(bytes.len() / 4);
+                        for chunk in bytes.chunks_exact(4) {
+                            let arr: [u8; 4] = chunk.try_into().unwrap();
+                            out.push(f32::from_le_bytes(arr));
+                        }
+                        Ok(VectorValue::F32(out))
+                    } else {
+                        Ok(VectorValue::I8(bytes.iter().map(|b| *b as i8).collect()))
+                    }
+                } else {
+                    Err(Error::Vector(format!(
+                        "cannot parse vector from string '{s}' (expected hex)"
+                    )))
+                }
+            }
+            Value::Object(map) => {
+                let ty = map
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("float32")
+                    .to_ascii_lowercase();
+                match ty.as_str() {
+                    "float32" | "f32" | "float" => {
+                        let xs =
+                            map.get("values")
+                                .or_else(|| map.get("vector"))
+                                .ok_or_else(|| {
+                                    Error::Vector("float vector object requires 'values'".into())
+                                })?;
+                        let mut out = Vec::new();
+                        for x in xs
+                            .as_array()
+                            .ok_or_else(|| Error::Vector("'values' must be an array".into()))?
+                        {
+                            out.push(x.as_f64().unwrap_or(0.0) as f32);
+                        }
+                        Ok(VectorValue::F32(out))
+                    }
+                    "int8" | "i8" => {
+                        let xs = map.get("values").ok_or_else(|| {
+                            Error::Vector("int8 vector object requires 'values'".into())
+                        })?;
+                        let mut out = Vec::new();
+                        for x in xs
+                            .as_array()
+                            .ok_or_else(|| Error::Vector("'values' must be an array".into()))?
+                        {
+                            let n = x
+                                .as_i64()
+                                .ok_or_else(|| Error::Vector("expected integer".into()))?;
+                            out.push(n.clamp(-128, 127) as i8);
+                        }
+                        Ok(VectorValue::I8(out))
+                    }
+                    "binary" | "bits" => {
+                        if let Some(h) = map.get("hex").and_then(|h| h.as_str()) {
+                            return Ok(VectorValue::Bits(hex_decode(h)?));
+                        }
+                        let xs = map.get("bits").ok_or_else(|| {
+                            Error::Vector("binary vector object requires 'bits' or 'hex'".into())
+                        })?;
+                        let mut bits = Vec::new();
+                        for x in xs
+                            .as_array()
+                            .ok_or_else(|| Error::Vector("'bits' must be an array".into()))?
+                        {
+                            bits.push(if x.as_i64().unwrap_or(0) != 0 {
+                                1u8
+                            } else {
+                                0u8
+                            });
+                        }
+                        let mut packed = vec![0u8; bits.len().div_ceil(8)];
+                        for (i, b) in bits.iter().enumerate() {
+                            if *b != 0 {
+                                packed[i / 8] |= 1 << (i % 8);
+                            }
+                        }
+                        Ok(VectorValue::Bits(packed))
+                    }
+                    other => Err(Error::Vector(format!("unknown vector type '{other}'"))),
+                }
+            }
+            _ => Err(Error::Vector(
+                "expected a JSON array, hex string, or vector object".into(),
+            )),
+        }
+    }
+
+    pub fn to_json(&self) -> Value {
+        match self {
+            VectorValue::F32(xs) => json!(xs),
+            VectorValue::I8(xs) => json!(xs),
+            VectorValue::Bits(xs) => json!(xs),
         }
     }
 }
@@ -98,9 +230,75 @@ impl VectorBlob {
             }
         }
     }
+
+    /// Hex encoding of the header + payload. Hex is used for SQLite storage
+    /// so vectors survive the JSON-shaped `SqlExecutor` result surface.
+    pub fn to_hex(&self) -> String {
+        let mut bytes = Vec::with_capacity(5 + self.bytes.len());
+        bytes.push(match self.ty {
+            ElementType::Float32 => 1,
+            ElementType::Int8 => 2,
+            ElementType::Binary => 3,
+        });
+        bytes.extend_from_slice(&(self.dim as u32).to_le_bytes());
+        bytes.extend_from_slice(&self.bytes);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self> {
+        let bytes = hex_decode(s)?;
+        if bytes.len() < 5 {
+            return Err(Error::Vector("vector blob is too short".into()));
+        }
+        let ty = match bytes[0] {
+            1 => ElementType::Float32,
+            2 => ElementType::Int8,
+            3 => ElementType::Binary,
+            other => return Err(Error::Vector(format!("unknown vector blob type {other}"))),
+        };
+        let dim = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+        Ok(Self {
+            ty,
+            dim,
+            bytes: bytes[5..].to_vec(),
+        })
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim_start_matches("0x");
+    if !s.len().is_multiple_of(2) {
+        return Err(Error::Vector("hex string has odd length".into()));
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in 0..s.len() / 2 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(Error::Vector(format!(
+            "invalid hex character {:?}",
+            b as char
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Distance {
     L2,
     Cosine,

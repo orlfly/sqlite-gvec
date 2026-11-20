@@ -5,65 +5,14 @@
 //! blob hex string) into a query execution. Used by the bindings and
 //! extension to wire `MATCH ... WHERE vector_nn(...)` predicates.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::storage::Storage;
 use crate::vector::{distance_metric as distance, knn_search, Distance, VectorBlob, VectorValue};
 use serde_json::Value;
 
 /// Build a `VectorValue` from a SQL scalar argument (JSON array or hex BLOB).
 pub fn vector_from_scalar(v: &Value) -> Result<VectorValue> {
-    match v {
-        Value::Array(xs) => {
-            // f32 by default
-            let mut out = Vec::with_capacity(xs.len());
-            for x in xs {
-                match x {
-                    Value::Number(n) => out.push(n.as_f64().unwrap_or(0.0) as f32),
-                    _ => return Err(Error::Vector("expected number".into())),
-                }
-            }
-            Ok(VectorValue::F32(out))
-        }
-        Value::String(s) => {
-            // hex blob → bytes
-            let bytes = hex_decode(s).map_err(|e| Error::Vector(e.to_string()))?;
-            // Heuristic: 4 bytes per f32
-            if bytes.len() % 4 == 0 {
-                let mut out = Vec::with_capacity(bytes.len() / 4);
-                for chunk in bytes.chunks_exact(4) {
-                    let arr: [u8; 4] = chunk.try_into().unwrap();
-                    out.push(f32::from_le_bytes(arr));
-                }
-                Ok(VectorValue::F32(out))
-            } else {
-                Ok(VectorValue::I8(bytes.iter().map(|b| *b as i8).collect()))
-            }
-        }
-        _ => Err(Error::Vector("expected JSON array or hex string".into())),
-    }
-}
-
-fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, String> {
-    let s = s.trim_start_matches("0x");
-    if s.len() % 2 != 0 {
-        return Err("odd length".into());
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for i in 0..s.len() / 2 {
-        let hi = hex_nibble(bytes[i * 2])?;
-        let lo = hex_nibble(bytes[i * 2 + 1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-fn hex_nibble(b: u8) -> std::result::Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(format!("invalid hex char {:?}", b as char)),
-    }
+    VectorValue::from_json(v)
 }
 
 /// Extract a node's stored vector (if any) given a property name. Currently a

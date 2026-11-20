@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "gvec"
+version = "0.1.0"
+description = "Graph, vector, and full-text storage embedded in SQLite"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+manifest-path = "crates/gvec-python/Cargo.toml"
+module-name = "gvec._gvec"
+python-source = "bindings/python"

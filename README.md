@@ -1,17 +1,22 @@
-# gvec — a Rust graph database with vector retrieval, embedded in SQLite
+# gvec — graph + vector + full-text storage, embedded in SQLite
 
-gvec is a from-scratch Rust implementation of a graph + vector database that
-runs on top of any SQLite build. It exposes:
+gvec is a from-scratch Rust implementation of a graph, vector, and full-text
+database that runs on top of any SQLite build. It exposes:
 
-- A `gvec0`-style vector virtual table with KNN search (L2 / cosine / inner-product)
+- Persistent vector indexes — **HNSW** (Qdrant-style), **IVF** (Milvus-style),
+  and flat exact — with L2 / cosine / inner-product distance over float32,
+  int8, and binary vectors
 - A Cypher-like graph query language (`CREATE`, `MATCH`, `OPTIONAL MATCH`,
   `WHERE`, `RETURN`, `SET`, `DELETE`, `ORDER BY`, `SKIP`, `LIMIT`) including
   directed, undirected, and variable-length `[r*1..3]` patterns
-- Vector-anchored graph traversal via a `vector_nn(...)` predicate
+- Vector-anchored graph traversal and hybrid retrieval via real `vector_nn(...)`
+  and `text_match(...)` rowid-set constraints
+- Full-text search through SQLite FTS5 with BM25 ranking (`CREATE TEXT INDEX`,
+  `text_match`, `text_score`)
 - A pure Rust API (`gvec` crate) that embeds SQLite via `rusqlite`
 - A loadable SQLite extension (`gvec_extension` crate) that registers
   `gvec_version()`, `gvec_dist()`, and a `gvec_query()` stub (see "scope")
-- Python bindings (ctypes loader)
+- Python bindings implemented in Rust with PyO3 (no ctypes or Python engine logic)
 
 The engine is **independent of `sqlite-vec` and `sqlite-graph`** — no source
 is reused, no dependency on those projects' crates. They are referenced only
@@ -21,8 +26,9 @@ as design inspiration.
 
 | Crate | Description | Status |
 | --- | --- | --- |
-| `gvec-core` | Storage, vector encoding, Cypher parser/executor, fusion | ✅ implemented (17 tests) |
-| `gvec` | In-process Rust binding over `rusqlite` | ✅ implemented (4 tests) |
+| `gvec-core` | Storage, HNSW/IVF/Flat indexes, Cypher parser/executor, FTS, fusion | ✅ implemented (27 tests) |
+| `gvec` | In-process Rust binding over `rusqlite` | ✅ implemented (33 tests) |
+| `gvec-python` | PyO3 Python extension (`gvec._gvec`) | ✅ implemented (smoke tested) |
 | `gvec-extension` | Loadable SQLite extension via `sqlite-loadable` | ✅ entry point + scalars (1 test) |
 
 ## Quick start (Rust)
@@ -35,7 +41,6 @@ serde_json = "1"
 
 ```rust
 use gvec::Database;
-use gvec::vector::{Distance, VectorValue};
 
 let db = Database::open_in_memory().unwrap();
 let g = db.graph("social").unwrap();
@@ -45,24 +50,85 @@ g.run(r#"CREATE (a:Person {name: "Alice", age: 30})-[:KNOWS]->(b:Person {name: "
 let rs = g.run("MATCH (n:Person) WHERE n.age > 20 RETURN n.name AS name ORDER BY n.age ASC").unwrap();
 assert_eq!(rs.rows.len(), 2);
 
-// KNN over an in-memory vector set
-let stored = vec![
-    (1, VectorValue::F32(vec![1.0, 0.0])),
-    (2, VectorValue::F32(vec![3.0, 0.0])),
-    (3, VectorValue::F32(vec![0.0, 0.0])),
-];
-let q = VectorValue::F32(vec![0.0, 0.0]);
-let nearest = g.knn(&q, &stored, 2, Distance::L2);
-assert_eq!(nearest[0].0, 3);
+// Persistent ANN index over a node property
+g.run(r#"CREATE (a:Doc {title: "origin", body: "the rust programming language", embedding: [0.0, 0.0]})"#).unwrap();
+g.run(r#"CREATE (b:Doc {title: "near",   body: "python is dynamic",              embedding: [1.0, 0.0]})"#).unwrap();
+g.run(r#"CREATE (c:Doc {title: "far",    body: "unrelated notes",               embedding: [5.0, 5.0]})"#).unwrap();
 
-// Full-text search via SQLite FTS5
-g.run(r#"CREATE (a:Doc {title: "Hello", body: "the rust programming language"})"#).unwrap();
-g.run(r#"CREATE (b:Doc {title: "World", body: "python is dynamic"})"#).unwrap();
+g.create_vector_index("Doc", "embedding", "hnsw", Some("l2"), None).unwrap();
+
+let rs = g.run(r#"
+    MATCH (n:Doc)
+    WHERE vector_nn(n.embedding, [0.0, 0.0], 2)
+    RETURN n.title AS title, vector_distance(n) AS distance
+"#).unwrap();
+assert_eq!(rs.rows[0][0], "origin");
+assert_eq!(rs.rows[1][0], "near");
+
+// Or create the index with query-language DDL
+g.run(r#"CREATE VECTOR INDEX ON :Doc(embedding)
+         USING IVF(nlist = 4, nprobe = 2, metric = "cosine")"#).unwrap();
+
+// Full-text search via SQLite FTS5 over the same nodes
 g.run(r#"CREATE TEXT INDEX ON :Doc(body)"#).unwrap();
 let rs = g.run(r#"MATCH (n:Doc) WHERE text_match(n.body, "rust") RETURN n.title AS title, text_score(n) AS score ORDER BY score DESC"#).unwrap();
 assert_eq!(rs.rows.len(), 1);
-assert_eq!(rs.rows[0][0], "Hello");
+assert_eq!(rs.rows[0][0], "origin");
+
+// Hybrid: textual relevance AND semantic similarity in one query
+let rs = g.run(r#"
+    MATCH (n:Doc)
+    WHERE text_match(n.body, "rust") AND vector_nn(n.embedding, [1.0, 0.0], 5)
+    RETURN n.title, text_score(n) AS text_score, vector_distance(n) AS distance
+    ORDER BY distance ASC
+"#).unwrap();
+assert_eq!(rs.rows.len(), 1);
 ```
+
+### Vector index algorithms
+
+- **HNSW** (default): hierarchical navigable small world. Levels are derived
+  deterministically from node ids, so indexes rebuild reproducibly from the
+  persisted vectors. Tunables: `m` (16), `m0` (2·m), `ef_construction` (200),
+  `ef_search` (64).
+- **IVF**: inverted-file clustering (Milvus `IVF_FLAT`). Tunables: `nlist` (16)
+  and `nprobe` (4). Float centroids are means; int8/binary centroids are
+  medoids.
+- **Flat**: exact brute-force scan. Used as the fallback when `vector_nn`
+  targets an unindexed property, and as the recall oracle in tests.
+
+Vectors and index definitions are persisted in the graph's shadow tables
+(`{graph}_vector_indexes`, `{graph}_vectors`). ANN structures are cached and
+rebuilt deterministically on demand after writes, so a restart never requires
+an external sidecar file.
+
+## Benchmarks
+
+```bash
+cargo run --release -p gvec --example vector_bench
+```
+
+The benchmark builds deterministic synthetic datasets, compares against
+brute-force ground truth, and reports build time, p50/p95 query latency, and
+recall@10. Sample run on one Linux x86-64 machine, single-threaded:
+
+| Dataset (10k vectors) | Index | Build | p50 | Recall@10 |
+| --- | --- | ---: | ---: | ---: |
+| 128d f32, clustered (32 clusters) | Flat | n/a | 1.80 ms | 1.000 |
+| 128d f32, clustered | HNSW, ef=64 | 2.8 s | 0.16 ms | 0.997 |
+| 128d f32, clustered | IVF, nprobe=4 | 0.8 s | 0.30 ms | 1.000 |
+| 128d f32, uniform random | Flat | n/a | 1.81 ms | 1.000 |
+| 128d f32, uniform random | HNSW, ef=64 | 18.2 s | 0.46 ms | 0.811 |
+| 128d f32, uniform random | HNSW, ef=256 | 18.2 s | 1.52 ms | 0.981 |
+| 64d int8 | HNSW, ef=64 | 10.6 s | 0.29 ms | 0.889 |
+| 256-bit binary (Hamming) | HNSW, ef=64 | 9.9 s | 0.27 ms | 0.555 |
+
+Real embeddings are usually clustered, where ANN indexes deliver roughly
+5-11x lower latency than a full scan at near-perfect recall. Uniform random
+high-dimensional vectors are the adversarial case: `ef_search` trades recall
+for latency at query time without rebuilding (`HnswIndex::search_with_ef`).
+Binary Hamming space has many distance ties and is the weakest case for the
+current graph heuristic.
 
 ## Quick start (SQLite extension)
 
@@ -80,23 +146,26 @@ Cypher executor lives in the `gvec` Rust binding and operates against a
 ## Quick start (Python)
 
 ```bash
-cargo build --release -p gvec-extension
-PYTHONPATH=bindings/python \
-  GVEC_LIB_PATH=$PWD/target/release/libgvec_extension.so \
-  python3 bindings/python/test_smoke.py
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install maturin
+maturin develop --release
+python bindings/python/tests/test_smoke.py
 ```
 
-Python requires a SQLite build with `--enable-load-extension` (not the
-default in many system Pythons).
+The Python package is a thin shim over the Rust extension. The engine,
+including SQLite, vector indexes, and FTS, is embedded directly, so no
+loadable SQLite extension is required.
 
 ## Workspace layout
 
 ```
 crates/
-  gvec-core/         # pure Rust: storage, vector, query, fusion
+  gvec-core/         # pure Rust: storage, vector, vector_index (HNSW/IVF), query, fts, fusion
   gvec-bindings/     # in-process Rust API over rusqlite
+  gvec-python/       # PyO3 extension module (built with maturin)
   gvec-extension/    # loadable SQLite extension (cdylib)
-bindings/python/     # Python ctypes binding
+bindings/python/     # Python package shim that re-exports gvec._gvec
 deny.toml            # cargo-deny config forbidding sqlite-vec/sqlite-graph
 ```
 
@@ -111,15 +180,16 @@ CI enforces this with a grep on `Cargo.toml` and `Cargo.lock`.
 
 ## Scope & non-goals
 
-- **In scope (v0.1)**: shadow-table node/edge storage, vector encoding
-  (f32/i8/binary), KNN, the GQL subset listed above, variable-length
+- **In scope (v0.2)**: shadow-table node/edge storage, vector encoding
+  (f32/i8/binary), persistent HNSW/IVF/Flat indexes, KNN and hybrid graph +
+  vector + text queries, the GQL subset listed above, variable-length
   patterns, Rust binding via `rusqlite`, scalar surface of the loadable
-  extension, Python ctypes binding.
+  extension, Rust/PyO3 Python binding.
 - **Out of scope (v0.1)**: full virtual-table implementation in the
   loadable extension (the `gvec0` vtab is exposed via the Rust binding;
   the extension exposes scalars only — see notes in
-  `crates/gvec-extension/src/lib.rs`), approximate ANN indexes (HNSW/IVF),
-  full Neo4j Cypher conformance, distributed storage.
+  `crates/gvec-extension/src/lib.rs`), product/scalar quantization
+  (IVF-PQ), full Neo4j Cypher conformance, distributed storage.
 
 ## Tests
 

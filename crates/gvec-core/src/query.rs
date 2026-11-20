@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::error::{Error, Result};
@@ -25,6 +25,8 @@ pub enum Statement {
     Delete(Delete),
     CreateTextIndex(CreateTextIndex),
     DropTextIndex(DropTextIndex),
+    CreateVectorIndex(CreateVectorIndex),
+    DropVectorIndex(DropVectorIndex),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -72,6 +74,20 @@ pub struct CreateTextIndex {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DropTextIndex {
+    pub label: String,
+    pub property: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CreateVectorIndex {
+    pub label: String,
+    pub property: String,
+    pub algorithm: Option<String>,
+    pub options: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DropVectorIndex {
     pub label: String,
     pub property: String,
 }
@@ -132,6 +148,7 @@ pub struct OrderItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Expr {
     Variable(String, Option<String>),
+    Array(Vec<Expr>),
     VectorNn {
         variable: String,
         property: Option<String>,
@@ -144,6 +161,9 @@ pub enum Expr {
         query: String,
     },
     TextScore {
+        variable: String,
+    },
+    VectorScore {
         variable: String,
     },
     Literal(Value),
@@ -259,9 +279,8 @@ impl<'a> Lexer<'a> {
             "NULL" => Tok::NullLit,
             "AND" | "OR" | "NOT" | "IN" | "CREATE" | "MATCH" | "OPTIONAL" | "RETURN" | "SET"
             | "DELETE" | "DETACH" | "WHERE" | "ORDER" | "BY" | "SKIP" | "LIMIT" | "ASC"
-            | "DESC" | "AS" | "VECTOR_NN" | "TEXT_MATCH" | "TEXT_SCORE" | "DROP" => {
-                Tok::Kw(s.to_ascii_uppercase())
-            }
+            | "DESC" | "AS" | "VECTOR_NN" | "VECTOR_SCORE" | "VECTOR_DISTANCE" | "TEXT_MATCH"
+            | "TEXT_SCORE" | "DROP" => Tok::Kw(s.to_ascii_uppercase()),
             _ => Tok::Ident(s.into()),
         }
     }
@@ -341,7 +360,7 @@ impl<'a> Lexer<'a> {
             position: None,
         })
     }
-    pub fn next(&mut self) -> Result<Token> {
+    pub fn next_token(&mut self) -> Result<Token> {
         self.skip_ws();
         let pos = self.pos;
         let Some(c) = self.peek() else {
@@ -479,7 +498,7 @@ impl Parser {
         let mut l = Lexer::new(src);
         let mut toks = Vec::new();
         loop {
-            let t = l.next()?;
+            let t = l.next_token()?;
             let done = t.kind == Tok::Eof;
             toks.push(t);
             if done {
@@ -561,6 +580,13 @@ impl Parser {
                     self.expect_ident("INDEX")?;
                     return Ok(Statement::CreateTextIndex(self.parse_create_text_index()?));
                 }
+                if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("VECTOR")) {
+                    self.bump();
+                    self.expect_ident("INDEX")?;
+                    return Ok(Statement::CreateVectorIndex(
+                        self.parse_create_vector_index()?,
+                    ));
+                }
                 Ok(Statement::Create(Create {
                     patterns: self.parse_patterns()?,
                 }))
@@ -573,10 +599,15 @@ impl Parser {
                     self.expect_ident("INDEX")?;
                     return Ok(Statement::DropTextIndex(self.parse_drop_text_index()?));
                 }
-                return Err(Error::Parse {
-                    message: "expected TEXT INDEX after DROP".into(),
+                if matches!(self.peek(), Tok::Ident(s) if s.eq_ignore_ascii_case("VECTOR")) {
+                    self.bump();
+                    self.expect_ident("INDEX")?;
+                    return Ok(Statement::DropVectorIndex(self.parse_drop_vector_index()?));
+                }
+                Err(Error::Parse {
+                    message: "expected TEXT INDEX or VECTOR INDEX after DROP".into(),
                     position: None,
-                });
+                })
             }
             Tok::Kw(k) if k == "MATCH" || k == "OPTIONAL" => {
                 Ok(Statement::Match(self.parse_match()?))
@@ -703,6 +734,158 @@ impl Parser {
         Ok(DropTextIndex { label, property })
     }
 
+    fn parse_create_vector_index(&mut self) -> Result<CreateVectorIndex> {
+        // ON :Label(property) [USING ALGORITHM(option = value, ...)]
+        self.expect_ident("ON")?;
+        self.expect_tok(Tok::Colon, ":")?;
+        let label = if let Tok::Ident(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            return Err(Error::Parse {
+                message: "expected label name".into(),
+                position: None,
+            });
+        };
+        self.expect_tok(Tok::LParen, "(")?;
+        let property = if let Tok::Ident(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            return Err(Error::Parse {
+                message: "expected property name".into(),
+                position: None,
+            });
+        };
+        self.expect_tok(Tok::RParen, ")")?;
+
+        let mut algorithm = None;
+        let mut options = Vec::new();
+        if self.peek_ident("USING") {
+            self.bump();
+            algorithm = Some(match self.peek().clone() {
+                Tok::Ident(s) => {
+                    self.bump();
+                    s
+                }
+                Tok::Kw(k) => {
+                    self.bump();
+                    k
+                }
+                _ => {
+                    return Err(Error::Parse {
+                        message: "expected vector index algorithm after USING".into(),
+                        position: None,
+                    })
+                }
+            });
+            if matches!(self.peek(), Tok::LParen) {
+                self.bump();
+                while !matches!(self.peek(), Tok::RParen) {
+                    let key = match self.peek().clone() {
+                        Tok::Ident(s) => {
+                            self.bump();
+                            s.to_ascii_lowercase()
+                        }
+                        Tok::Kw(k) => {
+                            self.bump();
+                            k.to_ascii_lowercase()
+                        }
+                        _ => {
+                            return Err(Error::Parse {
+                                message: "expected option name".into(),
+                                position: None,
+                            })
+                        }
+                    };
+                    self.expect_tok(Tok::Eq, "=")?;
+                    let value = self.parse_option_value()?;
+                    options.push((key, value));
+                    if matches!(self.peek(), Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect_tok(Tok::RParen, ")")?;
+            }
+        }
+        Ok(CreateVectorIndex {
+            label,
+            property,
+            algorithm,
+            options,
+        })
+    }
+
+    fn parse_drop_vector_index(&mut self) -> Result<DropVectorIndex> {
+        self.expect_ident("ON")?;
+        self.expect_tok(Tok::Colon, ":")?;
+        let label = if let Tok::Ident(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            return Err(Error::Parse {
+                message: "expected label name".into(),
+                position: None,
+            });
+        };
+        self.expect_tok(Tok::LParen, "(")?;
+        let property = if let Tok::Ident(s) = self.peek().clone() {
+            self.bump();
+            s
+        } else {
+            return Err(Error::Parse {
+                message: "expected property name".into(),
+                position: None,
+            });
+        };
+        self.expect_tok(Tok::RParen, ")")?;
+        Ok(DropVectorIndex { label, property })
+    }
+
+    fn parse_option_value(&mut self) -> Result<Value> {
+        match self.peek().clone() {
+            Tok::StrLit(s) => {
+                self.bump();
+                Ok(Value::String(s))
+            }
+            Tok::IntLit(n) => {
+                self.bump();
+                Ok(Value::from(n))
+            }
+            Tok::NumLit(f) => {
+                self.bump();
+                Ok(Value::Number(serde_json::Number::from_f64(f).ok_or_else(
+                    || Error::Parse {
+                        message: "invalid number in option".into(),
+                        position: None,
+                    },
+                )?))
+            }
+            Tok::BoolLit(b) => {
+                self.bump();
+                Ok(Value::Bool(b))
+            }
+            Tok::NullLit => {
+                self.bump();
+                Ok(Value::Null)
+            }
+            Tok::Ident(s) => {
+                self.bump();
+                Ok(Value::String(s))
+            }
+            Tok::Kw(k) => {
+                self.bump();
+                Ok(Value::String(k.to_ascii_lowercase()))
+            }
+            other => Err(Error::Parse {
+                message: format!("expected option value, got {other:?}"),
+                position: None,
+            }),
+        }
+    }
+
     fn peek_ident(&self, want: &str) -> bool {
         if let Tok::Ident(s) = self.peek() {
             s.eq_ignore_ascii_case(want)
@@ -809,9 +992,7 @@ impl Parser {
             self.expect_tok(Tok::RBracket, "]")?;
             // Trailing direction: `->` = out, `-` = either/undirected.
             let trailing_out = matches!(self.peek(), Tok::Arrow);
-            if trailing_out {
-                self.bump();
-            } else if matches!(self.peek(), Tok::Dash) {
+            if trailing_out || matches!(self.peek(), Tok::Dash) {
                 self.bump();
             }
             // Combine: `<-[...]-` = In,  `<-[...]->` = Either (both),  `-[...]->` = Out,  `-[...]-` = Either
@@ -1063,6 +1244,42 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr> {
         match self.peek().clone() {
+            Tok::LBracket => {
+                // Array literal, used for inline query vectors:
+                // `vector_nn(n.embedding, [1.0, 0.0], 10)`.
+                self.bump();
+                let mut items = Vec::new();
+                if !matches!(self.peek(), Tok::RBracket) {
+                    loop {
+                        items.push(self.parse_expr()?);
+                        if matches!(self.peek(), Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect_tok(Tok::RBracket, "]")?;
+                Ok(Expr::Array(items))
+            }
+            Tok::Dash => {
+                // Unary minus for numeric literals in expressions.
+                self.bump();
+                match self.peek().clone() {
+                    Tok::IntLit(n) => {
+                        self.bump();
+                        Ok(Expr::Literal(Value::from(-n)))
+                    }
+                    Tok::NumLit(f) => {
+                        self.bump();
+                        Ok(Expr::Literal(Value::from(-f)))
+                    }
+                    _ => Err(Error::Parse {
+                        message: "expected a number after '-'".into(),
+                        position: None,
+                    }),
+                }
+            }
             Tok::LParen => {
                 self.bump();
                 let e = self.parse_expr()?;
@@ -1147,6 +1364,15 @@ impl Parser {
                     let (var, _) = self.parse_var_with_prop()?;
                     self.expect_tok(Tok::RParen, ")")?;
                     return Ok(Expr::TextScore { variable: var });
+                }
+                if (k.eq_ignore_ascii_case("VECTOR_SCORE")
+                    || k.eq_ignore_ascii_case("VECTOR_DISTANCE"))
+                    && matches!(self.peek(), Tok::LParen)
+                {
+                    self.bump();
+                    let (var, _) = self.parse_var_with_prop()?;
+                    self.expect_tok(Tok::RParen, ")")?;
+                    return Ok(Expr::VectorScore { variable: var });
                 }
                 Err(Error::Parse {
                     message: format!("unexpected keyword {k}"),
@@ -1266,50 +1492,71 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
                 state.rows = vec![Row::new()];
             }
 
-            // Pre-extract TextMatch from WHERE to get FTS rowid set + scores.
-            // The rowid set is used to FILTER rows after execute_match; the
-            // scores are injected as __fts_score__ so text_score() in RETURN
-            // can read them.
-            let (fts_rowids, fts_scores): (
-                std::collections::HashSet<i64>,
-                std::collections::HashMap<i64, f32>,
-            ) = if let Some(where_) = &m.where_ {
-                if let Some((rowids, scores)) = extract_text_match(storage, where_, &m.patterns)? {
-                    (rowids.into_iter().collect(), scores)
+            // Pre-extract text_match and vector_nn from WHERE. Both act as
+            // rowid-set constraints rather than mere boolean filters:
+            // text_match yields BM25-ranked FTS rowids and vector_nn yields
+            // ANN-ranked node ids. The intersection feeds the graph scan.
+            let (text_variable, fts_rowids, fts_scores) = if let Some(where_) = &m.where_ {
+                if let Some((var, rowids, scores)) =
+                    extract_text_match(storage, where_, &m.patterns)?
+                {
+                    (Some(var), rowids.into_iter().collect(), scores)
                 } else {
-                    (Default::default(), Default::default())
+                    (None, HashSet::new(), HashMap::new())
                 }
             } else {
-                (Default::default(), Default::default())
+                (None, HashSet::new(), HashMap::new())
+            };
+
+            let vector_pred = if let Some(where_) = &m.where_ {
+                extract_vector_nn(storage, where_, &m.patterns)?
+            } else {
+                None
+            };
+            let (vector_variable, vector_distances, vector_candidates) = match vector_pred {
+                Some((var, distances, candidates)) => (Some(var), distances, Some(candidates)),
+                None => (None, HashMap::new(), None),
             };
 
             let mut current = state.rows.clone();
             for pattern in &m.patterns {
-                current = execute_match(storage, pattern, &current, m.optional)?;
+                current = execute_match(
+                    storage,
+                    pattern,
+                    &current,
+                    m.optional,
+                    vector_variable.as_deref(),
+                    vector_candidates.as_ref(),
+                )?;
             }
 
             // Filter rows by the FTS rowid set (when a text_match was used) AND
             // inject the BM25 score for text_score() lookup.
-            if !fts_rowids.is_empty() {
+            if text_variable.is_some() {
                 current.retain(|r| {
-                    let mut kept = false;
-                    for (_, value) in r.iter() {
-                        if let Some(Value::Object(node_obj)) = value.get("node") {
-                            if let Some(id) = node_obj.get("id").and_then(|v| v.as_i64()) {
-                                if fts_rowids.contains(&id) {
-                                    kept = true;
-                                    break;
-                                }
-                            }
-                        }
+                    if let Some(var) = &text_variable {
+                        row_node_id(r, var)
+                            .map(|id| fts_rowids.contains(&id))
+                            .unwrap_or(false)
+                    } else {
+                        r.keys().any(|var| {
+                            row_node_id(r, var)
+                                .map(|id| fts_rowids.contains(&id))
+                                .unwrap_or(false)
+                        })
                     }
-                    kept
                 });
             }
             for row in &mut current {
-                for (_, value) in row.iter() {
-                    if let Some(Value::Object(node_obj)) = value.get("node") {
-                        if let Some(id) = node_obj.get("id").and_then(|v| v.as_i64()) {
+                if let Some(var) = &text_variable {
+                    if let Some(id) = row_node_id(row, var) {
+                        if let Some(&score) = fts_scores.get(&id) {
+                            row.insert("__fts_score__".into(), Value::from(score as f64));
+                        }
+                    }
+                } else {
+                    for var in row.keys().cloned().collect::<Vec<_>>() {
+                        if let Some(id) = row_node_id(row, &var) {
                             if let Some(&score) = fts_scores.get(&id) {
                                 row.insert("__fts_score__".into(), Value::from(score as f64));
                                 break;
@@ -1318,12 +1565,61 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
                     }
                 }
             }
+
+            // Restrict to the ANN candidate set and attach distances so
+            // vector_score()/vector_distance() can expose them.
+            if let (Some(var), Some(candidates)) = (&vector_variable, &vector_candidates) {
+                current.retain(|r| {
+                    row_node_id(r, var)
+                        .map(|id| candidates.contains(&id))
+                        .unwrap_or(false)
+                });
+                for row in &mut current {
+                    if let Some(id) = row_node_id(row, var) {
+                        if let Some(&distance) = vector_distances.get(&id) {
+                            row.insert("__vector_distance__".into(), Value::from(distance as f64));
+                        }
+                    }
+                }
+            }
+
             state.text_scores = fts_scores;
             if let Some(w) = &m.where_ {
-                current = current
-                    .into_iter()
-                    .filter(|r| eval(w, r).as_bool().unwrap_or(false))
-                    .collect();
+                current.retain(|r| eval(w, r).as_bool().unwrap_or(false));
+            }
+
+            // With no explicit ORDER BY, vector matches keep their ANN
+            // distance order (ascending, like a standalone KNN query). A
+            // text-only query falls back to descending BM25 relevance.
+            let has_order = m
+                .return_
+                .as_ref()
+                .map(|r| !r.order_by.is_empty())
+                .unwrap_or(false);
+            if vector_candidates.is_some() && !has_order {
+                current.sort_by(|a, b| {
+                    let da = a
+                        .get("__vector_distance__")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::INFINITY);
+                    let db = b
+                        .get("__vector_distance__")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::INFINITY);
+                    da.total_cmp(&db)
+                });
+            } else if text_variable.is_some() && !has_order {
+                current.sort_by(|a, b| {
+                    let sa = a
+                        .get("__fts_score__")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::NEG_INFINITY);
+                    let sb = b
+                        .get("__fts_score__")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(f64::NEG_INFINITY);
+                    sb.total_cmp(&sa)
+                });
             }
             state.rows = current;
             Ok(state)
@@ -1405,32 +1701,42 @@ fn exec_statement(storage: &Storage, stmt: &Statement, mut state: ExecState) -> 
             )?;
             Ok(state)
         }
+        Statement::CreateVectorIndex(cvi) => {
+            let algorithm = cvi.algorithm.as_deref().unwrap_or("hnsw");
+            storage.create_vector_index(&cvi.label, &cvi.property, algorithm, &cvi.options)?;
+            Ok(state)
+        }
+        Statement::DropVectorIndex(dvi) => {
+            storage.drop_vector_index(&dvi.label, &dvi.property)?;
+            Ok(state)
+        }
     }
 }
 
 /// Extract a `text_match` predicate from the WHERE clause, run the FTS5 search,
-/// and return `(rowids, scores_by_rowid)`. Returns `None` if no text_match.
+/// and return `(variable, rowids, scores_by_rowid)`. Returns `None` if no
+/// text_match.
+type TextMatchPredicate = (String, Vec<i64>, HashMap<i64, f32>);
+type VectorNnPredicate = (String, HashMap<i64, f32>, HashSet<i64>);
+
 fn extract_text_match(
     storage: &Storage,
     where_: &Expr,
     patterns: &[Pattern],
-) -> Result<Option<(Vec<i64>, std::collections::HashMap<i64, f32>)>> {
+) -> Result<Option<TextMatchPredicate>> {
     // Find the TextMatch expression by walking the WHERE tree
     let tm = find_text_match(where_);
     let tm = match tm {
         Some(Expr::TextMatch {
-            property, query, ..
-        }) => (property.clone(), query.clone()),
+            variable,
+            property,
+            query,
+        }) => (variable.clone(), property.clone(), query.clone()),
         Some(_) => return Ok(None),
         None => return Ok(None),
     };
-    // Determine the label from the first pattern's first node
-    let label = patterns
-        .first()
-        .and_then(|p| p.segments.first())
-        .and_then(|s| s.node.labels.first())
-        .cloned()
-        .unwrap_or_default();
+    // Determine the label from the pattern that binds this variable.
+    let label = label_for_variable(patterns, &tm.0).unwrap_or_default();
     if label.is_empty() {
         return Err(Error::Query(
             "text_match requires a labeled node pattern".into(),
@@ -1441,13 +1747,13 @@ fn extract_text_match(
         storage.exec.as_ref(),
         &storage.prefix,
         &label,
-        &tm.0,
         &tm.1,
+        &tm.2,
         50,
     )?;
     let rowids: Vec<i64> = results.iter().map(|(id, _)| *id).collect();
     let scores: std::collections::HashMap<i64, f32> = results.into_iter().collect();
-    Ok(Some((rowids, scores)))
+    Ok(Some((tm.0, rowids, scores)))
 }
 
 /// Recursively search for a TextMatch expression in the WHERE tree.
@@ -1459,6 +1765,78 @@ fn find_text_match(e: &Expr) -> Option<&Expr> {
         Expr::Cmp(a, _, b) => find_text_match(a).or_else(|| find_text_match(b)),
         _ => None,
     }
+}
+
+/// Extract a `vector_nn(variable.property, query, k)` predicate, run the ANN
+/// (or exact fallback) search, and return `(variable, distances, candidates)`.
+fn extract_vector_nn(
+    storage: &Storage,
+    where_: &Expr,
+    patterns: &[Pattern],
+) -> Result<Option<VectorNnPredicate>> {
+    let Some(predicate) = find_vector_nn(where_) else {
+        return Ok(None);
+    };
+    let Expr::VectorNn {
+        variable,
+        property,
+        k,
+        query,
+    } = predicate
+    else {
+        return Ok(None);
+    };
+    let property = property.clone().ok_or_else(|| {
+        Error::Query(format!(
+            "vector_nn requires a vector property on '{variable}' (e.g. vector_nn({variable}.embedding, [...], k))"
+        ))
+    })?;
+    if *k <= 0 {
+        return Ok(Some((variable.clone(), HashMap::new(), HashSet::new())));
+    }
+    let label = label_for_variable(patterns, variable).ok_or_else(|| {
+        Error::Query(format!(
+            "vector_nn requires a labeled node; '{variable}' has no label"
+        ))
+    })?;
+    let value = eval(query, &Row::new());
+    if value.is_null() {
+        return Err(Error::Query(
+            "vector_nn query vector must be an array literal (e.g. [0.1, 0.2]) or hex string"
+                .into(),
+        ));
+    }
+    let vector = crate::vector::VectorValue::from_json(&value)?;
+    let results = storage.vector_search(&label, &property, &vector, *k as usize)?;
+    let distances: HashMap<i64, f32> = results.iter().copied().collect();
+    let candidates: HashSet<i64> = results.into_iter().map(|(id, _)| id).collect();
+    Ok(Some((variable.clone(), distances, candidates)))
+}
+
+fn find_vector_nn(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::VectorNn { .. } => Some(e),
+        Expr::And(a, b) | Expr::Or(a, b) => find_vector_nn(a).or_else(|| find_vector_nn(b)),
+        Expr::Not(a) => find_vector_nn(a),
+        Expr::Cmp(a, _, b) => find_vector_nn(a).or_else(|| find_vector_nn(b)),
+        _ => None,
+    }
+}
+
+fn label_for_variable(patterns: &[Pattern], variable: &str) -> Option<String> {
+    for pattern in patterns {
+        for segment in &pattern.segments {
+            if segment.node.variable == variable {
+                return segment.node.labels.first().cloned();
+            }
+        }
+    }
+    None
+}
+
+/// Read the node id bound to `variable` from a result row.
+fn row_node_id(row: &Row, variable: &str) -> Option<i64> {
+    row.get(variable)?.get("node")?.get("id")?.as_i64()
 }
 
 fn execute_create(storage: &Storage, p: &Pattern, rows: Vec<Row>) -> Result<Vec<Row>> {
@@ -1514,6 +1892,8 @@ fn execute_match(
     p: &Pattern,
     base_rows: &[Row],
     optional: bool,
+    candidate_variable: Option<&str>,
+    candidate_ids: Option<&HashSet<i64>>,
 ) -> Result<Vec<Row>> {
     let first_node = &p.segments[0].node;
     let mut nodes: Vec<Node> = if first_node.labels.is_empty() {
@@ -1529,6 +1909,14 @@ fn execute_match(
         all.dedup_by_key(|n| n.id.0);
         all
     };
+    // The vector_nn candidate set constrains the scan when it targets this
+    // pattern's first node. Other patterns still evaluate normally (the
+    // executor intersects candidate sets at the row level afterwards).
+    if candidate_variable == Some(first_node.variable.as_str()) {
+        if let Some(ids) = candidate_ids {
+            nodes.retain(|n| ids.contains(&n.id.0));
+        }
+    }
     // Apply inline property filters from the node pattern, e.g.
     // `MATCH (n:Person {name: "Alice"})`. Properties are matched against the
     // node's stored property map.
@@ -1764,17 +2152,7 @@ fn apply_assign(storage: &Storage, row: &mut Row, a: &Assign, val: Value) -> Res
                     val.clone()
                 };
                 let labels = n.labels.clone();
-                storage.exec.execute(
-                    &format!(
-                        "UPDATE {}_nodes SET labels = ?1, properties = ?2 WHERE id = ?3",
-                        storage.prefix
-                    ),
-                    &[
-                        SqlValue::Text(serde_json::to_string(&labels)?),
-                        SqlValue::Text(serde_json::to_string(&new_props)?),
-                        SqlValue::from(n.id.0),
-                    ],
-                )?;
+                storage.update_node(n.id, &labels, &new_props)?;
                 n.properties = new_props;
                 row.insert(a.variable.clone(), node_to_value(n));
                 return Ok(());
@@ -1856,6 +2234,7 @@ fn eval(e: &Expr, row: &Row) -> Value {
                 Value::Null
             }
         }
+        Expr::Array(items) => Value::Array(items.iter().map(|item| eval(item, row)).collect()),
         Expr::Cmp(a, op, b) => {
             let av = eval(a, row);
             let bv = eval(b, row);
@@ -1868,7 +2247,12 @@ fn eval(e: &Expr, row: &Row) -> Value {
             eval(a, row).as_bool().unwrap_or(false) || eval(b, row).as_bool().unwrap_or(false),
         ),
         Expr::Not(a) => Value::Bool(!eval(a, row).as_bool().unwrap_or(false)),
-        Expr::VectorNn { .. } => Value::Bool(true),
+        Expr::VectorNn { .. } => {
+            // The executor has already restricted rows to the ANN candidate
+            // set and attached distances; presence of a distance means this
+            // row is within the top-k.
+            Value::Bool(row.contains_key("__vector_distance__"))
+        }
         Expr::TextMatch { .. } => Value::Bool(true),
         Expr::TextScore { variable } => {
             // The score for this row was injected by the executor; read it.
@@ -1880,6 +2264,14 @@ fn eval(e: &Expr, row: &Row) -> Value {
                 return score.clone();
             }
             Value::from(0.0f64)
+        }
+        Expr::VectorScore { variable } => {
+            let _ = variable;
+            if let Some(distance) = row.get("__vector_distance__") {
+                distance.clone()
+            } else {
+                Value::Null
+            }
         }
     }
 }
@@ -1940,20 +2332,20 @@ fn materialize(rows: &[Row], ret: &Return) -> Result<ResultSet> {
         }
         out_rows.push(out_row);
     }
-    // simple single-key ORDER BY evaluated against the bound rows
-    if let Some(ob) = ret.order_by.first() {
-        let desc = ob.desc;
+    // Multi-key ORDER BY evaluated against the bound rows.
+    if !ret.order_by.is_empty() {
         let mut indexed: Vec<(Vec<Value>, Row)> =
             out_rows.iter().cloned().zip(rows.iter().cloned()).collect();
         indexed.sort_by(|x, y| {
-            let va = eval(&ob.expr, &x.1);
-            let vb = eval(&ob.expr, &y.1);
-            let ord = cmp_json(&va, &vb);
-            if desc {
-                ord.reverse()
-            } else {
-                ord
+            for ob in &ret.order_by {
+                let va = eval_order_expr(&ob.expr, &x.1, ret);
+                let vb = eval_order_expr(&ob.expr, &y.1, ret);
+                let ord = cmp_json(&va, &vb);
+                if ord != std::cmp::Ordering::Equal {
+                    return if ob.desc { ord.reverse() } else { ord };
+                }
             }
+            std::cmp::Ordering::Equal
         });
         out_rows = indexed.into_iter().map(|(r, _)| r).collect();
     }
@@ -1971,6 +2363,21 @@ fn materialize(rows: &[Row], ret: &Return) -> Result<ResultSet> {
         columns,
         rows: out_rows,
     })
+}
+
+/// Evaluate an ORDER BY expression, resolving a bare alias such as
+/// `ORDER BY distance` to the corresponding RETURN item.
+fn eval_order_expr(expr: &Expr, row: &Row, ret: &Return) -> Value {
+    if let Expr::Variable(name, None) = expr {
+        if let Some(item) = ret
+            .items
+            .iter()
+            .find(|item| item.alias.as_deref() == Some(name.as_str()))
+        {
+            return eval(&item.expr, row);
+        }
+    }
+    eval(expr, row)
 }
 
 fn cmp_json(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -2016,6 +2423,7 @@ mod tests {
     pub struct MockState {
         rows: std::collections::BTreeMap<(String, i64), Vec<SqlValue>>,
         next_id: i64,
+        #[allow(dead_code)]
         schemas: std::collections::HashSet<String>,
     }
 
@@ -2155,7 +2563,7 @@ mod tests {
     fn fresh_storage() -> Storage {
         // Per-test exec. Different tests use different prefixes so they don't collide.
         let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
-        Storage::new(MockExec::new(), &format!("t{id}"))
+        Storage::new(MockExec::new(), format!("t{id}"))
     }
 
     #[test]

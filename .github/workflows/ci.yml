@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libclang-dev sqlite3 libsqlite3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true
+      - name: cargo fmt
+        run: cargo fmt --check
+        continue-on-error: true
+
+  independence:
+    name: Independence guard (no sqlite-vec / sqlite-graph)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Grep Cargo.lock for forbidden crates
+        run: |
+          if grep -E '^name = "(sqlite-vec|sqlite-vec-sys|sqlite_graph|sqlite-graph|sqlitegraph)"$' Cargo.lock; then
+            echo "forbidden dependency found"; exit 1
+          fi
+          if grep -rE '\b(sqlite-vec|sqlite-vec-sys|sqlite_graph|sqlite-graph|sqlitegraph)\b' crates/*/Cargo.toml; then
+            echo "forbidden dependency in Cargo.toml"; exit 1
+          fi
+
+  python:
+    name: Python extension (PyO3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+      - name: Format and lint Python crate
+        run: |
+          cargo fmt --manifest-path crates/gvec-python/Cargo.toml --check
+          cargo clippy --manifest-path crates/gvec-python/Cargo.toml -- -D warnings
+      - name: Build and test wheel
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin develop --release
+          .venv/bin/python bindings/python/tests/test_smoke.py

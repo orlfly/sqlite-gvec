@@ -5,6 +5,10 @@ members = [
     "crates/gvec-extension",
     "crates/gvec-bindings",
 ]
+# The Python extension is built separately (maturin / cargo --manifest-path)
+# because PyO3 extension modules have different linking requirements from the
+# test workspace.
+exclude = ["crates/gvec-python"]
 
 [workspace.package]
 version = "0.1.0"
